@@ -13,6 +13,9 @@ multi-chunk take.
 This is a one-person research project on one camera. It is not a polished release, and there
 is no installer that hides the risk. Read [Safety](#safety) before you put it on a card.
 
+<iframe width="560" height="315" src="https://youtube.com" title="Canon EOS M10 - RAW video test" frameborder="0" allowfullscreen></iframe>
+
+
 ## How it works, briefly
 
 The DIGIC 6 has a block (PACK32) that can send the sensor's RAW stream to an EDMAC channel.
