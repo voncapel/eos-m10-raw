@@ -1,0 +1,2 @@
+DISABLE_GCC_VERSION_CHECK=1
+CFLAGS+=-std=gnu11 -Wno-error

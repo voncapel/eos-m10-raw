@@ -1,0 +1,18 @@
+# Local checkouts and data, never committed
+chdk/
+dumps/
+ghidra/
+captures/
+builds/
+*.MLV
+*.M0[0-9]
+*.dng
+*.mp4
+*.mov
+
+# Build products
+__pycache__/
+*.pyc
+*.o
+.DS_Store
+._*

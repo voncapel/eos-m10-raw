@@ -1,0 +1,22 @@
+diff --git a/trunk/modules/Makefile b/trunk/modules/Makefile
+index fe9dcd77..a45127e3 100644
+--- a/trunk/modules/Makefile
++++ b/trunk/modules/Makefile
+@@ -15,7 +15,7 @@ FLTS=$Ofselect.flt $Oedgeovr.flt $Ocurves.flt $Ompopup.flt $Opalette.flt $Ogrids
+      $Otxtread.flt $Omemview.flt $Omodinsp.flt $Otetris.flt $Osnake.flt $Osudoku.flt $O_tbox.flt $O_osd_le.flt \
+      $Oexmemins.flt $Ofshelter.flt $Ofwcrc.flt \
+      $O_hexbox.flt $Oubasic.flt $Olua.flt $Ocpuinfo.flt $Ouseredit.flt $Oeyefi.flt $Ohisto.flt $Oshothist.flt \
+-     $Oscrdump.flt $O_confmig.flt $Orawevhst.flt
++     $Oscrdump.flt $O_confmig.flt $Orawevhst.flt $Om10cine.flt
+ 
+ # Include optional rules for user defined modules
+ # Can be used to add additional modules to FLTS and add the rules to build them
+@@ -75,6 +75,8 @@ $Ofwcrc.flt: $Ofirmware_crc.o
+ $Oscrdump.flt: $Oscrdump.o
+ $O_confmig.flt: $Oconf_migrate.o
+ $Orawevhst.flt: $Oraw_ev_histo.o
++$Om10cine.flt: $Om10_cine.o
++$Om10_cine.o: m10_cine.c m10_tasktrace.h
+ 
+ $Oubasic.flt: $Oubasic.o $Oscript_key_funcs.o $(lubasic)/$Olibubasic.a
+ $Olua.flt: $Oluascript.o $Oscript_key_funcs.o $Oscript_shoot_hook.o $Ocordic_math.o $Odbg_dump.o $Orawhookops.o $(llua)/$Oliblua.a
