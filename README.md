@@ -13,8 +13,7 @@ multi-chunk take.
 This is a one-person research project on one camera. It is not a polished release, and there
 is no installer that hides the risk. Read [Safety](#safety) before you put it on a card.
 
-<iframe width="560" height="315" src="https://youtube.com" title="Canon EOS M10 - RAW video test" frameborder="0" allowfullscreen></iframe>
-
+[![Canon EOS M10 - RAW video test](https://youtube.com)](https://www.youtube.com/watch?v=bDyuFj6pS3c)
 
 ## How it works, briefly
 
