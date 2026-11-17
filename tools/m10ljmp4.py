@@ -58,7 +58,7 @@ def chained(files, first, last):
             yield from orig(f)
     L.frames = lambda fn: frames()
     try:
-        yield from L.repaired(None, first, last)
+        yield from L.repaired(files[0], first, last)   # v176: files[0] gives bpp/black/white (RAWI); frames() ignores it
     finally:
         L.frames = orig
 

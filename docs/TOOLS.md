@@ -20,6 +20,7 @@ where the tool was written; [HISTORY.md](HISTORY.md) has the context.
 | `m10ljmp4.py` | Full-resolution H.264 from one or several chunks |
 | `m10export.py` | CinemaDNG sequence or ProRes 4444 LogC3 / AWG3 for grading |
 | `m10huff.py` | Optimal Huffman tables from sample captures -> `M10HUF.BIN` |
+| `test_m10_v167.py`, `test_m10hefix.py` | Host unit tests of the module source (profiles, MLV chunking, drain, head-error replacement); need `cc` |
 | `lj92d.c` | Lossless JPEG decoder used by all the readers (build to `/tmp/ljc/lj92d`) |
 | `m10mlv.py` | MLV writer/reader, DNG with focus-pixel fix, chunk repair (`--fix`, `--fps`) |
 | `m10raw2dng.py` | Single-frame DNG writer, with the EOS M10 colour matrix |

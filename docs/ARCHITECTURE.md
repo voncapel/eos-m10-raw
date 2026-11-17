@@ -17,7 +17,7 @@ first; most code is at the same address, not all of it).
 - **Shadow**: Canon keeps a RAM copy of every engine register it writes (`EngDrvOut`),
   at `*(0x28dbc) + (reg & 0x7ffff)`. This is the only safe way to read engine registers.
 - **OB**: optical black, masked pixels. 72 columns on the left and 28 rows at the top in
-  the magnifier (84/28 in Film mode). Black level is 127.5 in 10-bit units.
+  the magnifier (84/28 in Film mode). Black level is 127.5 in 10-bit units, 2048 in 14-bit (`0x10` HEAD tap, v171+).
 - **Film 3×3 / 1×3**: Canon's movie mode reads every third line and bins columns by 3 (3×3).
   1×3 is the Magic Lantern-style variant that reads every line (TG `0x800c` = 0).
 - **Magnifier**: the ×5 focus loupe. It reads a 2592 × 1108 window at 1:1, no skipping.
@@ -124,6 +124,12 @@ freezes the camera). Entry points on 110d: init `0xfc58183e`, CBR `0xfc581828`, 
   left-aligns: decoded samples are the 10-bit values << 4, bit-exact.
 - Those 4 empty low bits cost about 40 % of file size. There is no known way to remove them in
   hardware (unpacker values other than 0 freeze the camera or overflow).
+- v170+: true 14-bit input avoids the problem. PACK32 is fed from the `0x10` (HEAD) tap at 14
+  bits, RD1 stays at 14 bits, and the encoder's native crop (`args[0]`/`args[3]`, source stride
+  2592) reads only 1920 or 2048 columns. 2048 × 1104 × 14 bits = 3.96 MB of input (< 4 MiB,
+  two CH12 blocks), ~39.4 ms per frame: fits 24.000 fps, not 25.
+- Use `A/M10HUF14.BIN` for 14-bit takes (loaded automatically when the depth is 14). The 10-bit
+  table gives 12-13-bit codes to common categories and heavy `0xff 0x00` stuffing (+33 %).
 - RD1 only works with 2-byte bursts. 4/8/16-byte bursts stall the encoder.
 - Encoder speed is bounded by RD1 reads: ~100 MB/s of input, ~35 ms for 2592 × 1104.
 - Custom Huffman tables (`A/M10HUF.BIN`, made by `tools/m10huff.py`) must have exactly 15

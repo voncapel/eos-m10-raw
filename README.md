@@ -3,9 +3,12 @@
 Lossless RAW video on a Canon EOS M10 (firmware 1.10d), recorded to the SD card by a
 CHDK module. No host computer is needed once the card is set up.
 
-What works today: 2304 × 1076, 10-bit Bayer, 25 fps, lossless-compressed MLV, read 1:1
-from the sensor (no line skipping) in Canon's ×5 magnifier. One-minute takes complete with
-0 dropped frames on ordinary scenes. You start and stop takes with the camera's REC button.
+What works today: **true 14-bit RAW**, 2048 × 1076 (2K DCI) or 1920 × 1076 at 24.000 fps,
+lossless-compressed MLV, read 1:1 from the sensor (no line skipping) in Canon's ×5 magnifier.
+Test takes of 150 frames run with 0 dropped frames, and the rare sensor head error is repaired
+in the camera. The older 10-bit profiles (up to 2512 wide, 24p/25p) are still in the shell.
+You start and stop takes with the camera's REC button, and set ISO, shutter and aperture from
+the shell.
 `tools/m10export.py` turns a take into CinemaDNG or ProRes 4444 LogC3 for Resolve. Third-party
 MLV players have not been tested much on these LJ92 files; one failed at the end of a
 multi-chunk take.
@@ -40,12 +43,14 @@ All three are removed when the shell exits, and none survive a power cycle.
 | | |
 |---|---|
 | Camera / firmware | EOS M10, 1.10d only (addresses are hard-coded for 1.10d) |
-| Mode | ×5 magnifier, 2592 × 1104 read, 2304 × 1076 recorded (centre crop of 2520 × 1076 active) |
-| Depth / codec | 10-bit sensor data in a 14-bit lossless JPEG (LJ92) container, MLV class `0x21` |
-| Rate | 25.0 fps steady, ~2.4-3.0 MB per frame, ~73-76 MB/s to the card |
-| Longest clean take | 1500/1500 frames (60 s) at 2592 wide, 0 drops, 0 head errors |
-| Known losses | ~3 frames missing at the start of every take; very detailed scenes exceed the card bus and drop about 1 frame in 8 while they last |
-| Module version | v166 |
+| Mode | ×5 magnifier, 2592 × 1104 read, centre crop recorded |
+| Default profile | `24p 2K 14b`: 2048 × 1104 (2048 × 1076 active), 14-bit unity (pre-processor tap `0x10` HEAD), LJ92, MLV class `0x21` |
+| Other profiles | `24p 1920 14b`, `25p 1920 14b`; 10-bit: `24p 2304/2512/2048/1920`, `25p 2304` |
+| Rate (14-bit 2K) | 24.000 fps, encoder ~39.4 ms per frame (max 39.9 of 41.7), ~2.2-2.3 MB per frame, ~53 MB/s to the card |
+| Validated | 4 × 150 frames at 2048 × 1104 14-bit (v173 encoder path): 0 drops, 0 encoder errors; head-error frames replaced by the previous frame with correct MLV numbering and timestamps |
+| Image | 14-bit unity gain, no missing codes, black 2048, read noise ~11.6 ADU (OB) |
+| Known limits | 14-bit is magnifier-only: Film 1×3 with the `0x10` tap still gives short frames. Very long 14-bit takes not yet qualified |
+| Module version | v176 |
 
 Full-sensor Film mode (1808 × 1184, 3×3 line skipping) also reaches 25 fps for a minute,
 but the moiré and highlight banding made it unusable, so that path is frozen. See
@@ -65,22 +70,31 @@ macOS or Linux with `arm-none-eabi-gcc`, Python 3 with `numpy` and `scipy`, and 
    ```
 
 2. Copy to the card: `m10cine.flt` into `CHDK/MODULES/`, `card/CHDK/SCRIPTS/M10SHELL.LUA`
-   into `CHDK/SCRIPTS/`, and `card/M10HUF.BIN` to the card root (Huffman tables tuned on our
-   footage; without it the encoder uses Canon's tables and the files get about 10 % bigger).
+   into `CHDK/SCRIPTS/`, and `card/M10HUF.BIN` and `card/M10HUF14.BIN` to the card root
+   (Huffman tables tuned on our footage, for 10-bit and 14-bit takes. Without the 14-bit table
+   a 14-bit take is ~25 % bigger and the 2K profile no longer fits the card bandwidth).
 3. In CHDK, enable Lua native calls, load `M10SHELL.LUA` as the script, and run it (or set it
    to autostart). Leave the USB cable unplugged: the shell refuses to run with USB power.
 4. Put the camera in M (photo) mode and touch the screen to open the ×5 magnifier. The shell
-   shows a small RAW preview in the corner. REC starts a take, REC again stops it. Takes are
-   `A/M10_0001.MLV` (+ `.M00`, `.M01` chunks under 4 GB), 3000 frames (2 min) at most.
-   MENU + SET quits the shell.
+   shows a RAW preview (thumbnail or full frame) and a HUD: REC dot and timer, profile, card
+   minutes left, battery, and a bottom bar ISO / Tv / F / profile / zebras / view. UP/DOWN
+   picks a field, LEFT/RIGHT changes it. REC (or SET) starts a take, REC again stops it. After
+   changing between a 24p and a 25p profile, leave and re-enter ×5. Takes are
+   `A/M10_0001.MLV` (+ `.M00`, `.M01` chunks under 4 GB), 3000 frames at most.
+   Hold MENU for 1 s (or MENU + SET) to quit the shell; keys go back to Canon.
 5. On the computer:
 
    ```sh
    cc -O2 -o /tmp/ljc/lj92d tools/lj92d.c
    python3 tools/m10ljmlv.py --check M10_0001.MLV          # decode every frame
-   python3 tools/m10export.py dng    M10_0001.MLV out_dng/  # CinemaDNG
-   python3 tools/m10export.py prores M10_0001.MLV out.mov   # ProRes 4444, LogC3 / AWG3
+   FPS=24 python3 tools/m10export.py dng    M10_0001.MLV out_dng/  # CinemaDNG
+   FPS=24 python3 tools/m10export.py prores M10_0001.MLV out.mov   # ProRes 4444, LogC3 / AWG3
    ```
+
+   Bit depth, black and white levels are read from the take (10-bit or 14-bit). `FPS` is only
+   the rate written in the output file: set 24 for the 24p profiles.
+
+   Host regression tests (no camera): `python3 -m unittest tools/test_m10_v167.py tools/test_m10hefix.py`.
 
 ## Safety
 

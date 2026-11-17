@@ -42,7 +42,21 @@ def frames(fn):
         pos += sz
 
 
-def decode(parts):
+def mlv_info(fn):
+    """Read bpp, black, white from the MLV RAWI block (default 10-bit legacy)."""
+    d = open(fn, 'rb').read(512)
+    pos = 0
+    while pos + 8 <= len(d):
+        k = d[pos:pos + 4]; sz = struct.unpack_from('<I', d, pos + 4)[0]
+        if sz < 8: break
+        if k == b'RAWI' and sz >= 60:
+            bpp, black, white = struct.unpack_from('<3I', d, pos + 44)
+            return bpp, float(black), int(white)
+        pos += sz
+    return 10, 127.5, 1023
+
+
+def decode(parts, shift=4):
     out = []
     with tempfile.TemporaryDirectory() as t:
         for i, p in enumerate(parts):
@@ -53,7 +67,8 @@ def decode(parts):
             u = np.fromfile(b, '<u2')
             w = int(r.stdout.split()[0]) if r.stdout.split() else W   # live116: lj92d prints the decoded width (2592 in the x5 magnifier)
             out.append(u.reshape(-1, w))
-    return (np.vstack(out) >> 4).astype(np.uint16)
+    arr = np.vstack(out)
+    return (arr >> shift).astype(np.uint16) if shift else arr.astype(np.uint16)
 
 
 def resync(img):
@@ -118,7 +133,9 @@ def repaired(fn, first=0, last=None):
         s = ob_shift(img)
         if s: stats['shifted'] += 1; img = unshift(img, s)
         return k, img.astype(np.int32)
-    src = ((k, decode(p)) for k, p in frames(fn) if k >= first and (last is None or k < last))
+    bpp, _, _ = mlv_info(fn)
+    sh = 0 if bpp == 14 else 4
+    src = ((k, decode(p, shift=sh)) for k, p in frames(fn) if k >= first and (last is None or k < last))
     src = (fix(k, im) for k, im in src if im is not None)
     def emit(i):
         nonlocal prev_out
@@ -126,14 +143,16 @@ def repaired(fn, first=0, last=None):
         nb = [win[j][1] for j in (i - 1, i + 1) if 0 <= j < len(win)]
         if prev_out is not None and len(nb) == 2:
             d = np.minimum(*[np.abs(cur - n)[:, 100:1700].mean(1) for n in nb])
-            med = np.median(d)
-            bad = d > max(4 * med, 8)
-            if bad.sum() >= 2:
+            base = float(np.percentile(d[28:], 10))
+            sc14 = cur.max() > 1024
+            bad = d > max(4.0 * base, 95.0 if sc14 else 8.0)
+            strong = d > max(6.5 * base, 260.0 if sc14 else 20.0)
+            if bad.sum() >= 180 or strong.sum() >= 2:
                 cur = cur.copy()
                 if bad.sum() >= 16:                      # seam: the rest of the frame is garbage
                     r0 = int(np.argmax(bad)); m = np.zeros_like(bad); m[r0:] = True
                 else:                                    # a few rows: patch them (+-4)
-                    m = np.convolve(bad, np.ones(9), 'same') > 0
+                    m = np.convolve(strong, np.ones(9), 'same') > 0
                 cur[m] = prev_out[m]
                 stats['patched'] += 1; stats['rows'] += int(m.sum())
                 win[i] = (k, cur)
@@ -154,28 +173,36 @@ def images(fn, first=0, last=None):
     """Frames ready for output: repaired() (REPAIR=1, default) or the old per-frame resync()."""
     if os.environ.get('REPAIR', '1') != '0':
         yield from repaired(fn, first, last); return
+    bpp, _, _ = mlv_info(fn)
+    sh = 0 if bpp == 14 else 4
     for k, parts in frames(fn):
         if k < first or (last is not None and k >= last): continue
-        img = decode(parts)
+        img = decode(parts, shift=sh)
         if img is None: continue
         yield k, resync(img)[0]
 
 
 def main(a):
+    bpp, black_lv, white_lv = mlv_info(a[1]) if len(a) > 1 and os.path.exists(a[1]) else (10, 127.5, 1023)
+    sh = 0 if bpp == 14 else 4
     if a[0] == '--check':
         n = bad = 0; sizes = []
         for k, parts in frames(a[1]):
-            img = decode(parts); n += 1; sizes.append(sum(len(p) for p in parts))
+            img = decode(parts, shift=sh); n += 1; sizes.append(sum(len(p) for p in parts))
             if img is None: bad += 1
-        print('%d frames, %d failed, size avg %.2f MB max %.2f MB, last shape %s' % (n, bad, np.mean(sizes) / 1e6, max(sizes) / 1e6, None if img is None else img.shape))
+        print('%d frames (%d-bit), %d failed, size avg %.2f MB max %.2f MB, last shape %s' % (n, bpp, bad, np.mean(sizes) / 1e6, max(sizes) / 1e6, None if img is None else img.shape))
     elif a[0] == '--mp4':
         out = a[2]; fps = a[3] if len(a) > 3 else '12.5'
         p = None; sc = None
         for k, img in images(a[1]):
-            if os.environ.get('AFFIX', '1') != '0':
-                import m10mlv as M
-                M.fix_af(img, 127, geom='3x3')
-            x = img[28:28 + 1156, 84:84 + 1724].astype(np.float32) - 127.5
+            if img.shape[1] == 1808:
+                if os.environ.get('AFFIX', '1') != '0':
+                    import m10mlv as M
+                    M.fix_af(img, int(round(black_lv)), geom='3x3')
+                x = img[28:28 + 1156, 84:84 + 1724].astype(np.float32) - black_lv
+            else:
+                x = img[28:, 72 if img.shape[1] == 2592 else 0:]
+                x = x[:x.shape[0] // 2 * 2, :x.shape[1] // 2 * 2].astype(np.float32) - black_lv
             r = x[0::2, 0::2] / 0.48; g = (x[0::2, 1::2] + x[1::2, 0::2]) / 2; b = x[1::2, 1::2] / 0.66
             rgb = np.stack([r, g, b], -1)
             if sc is None: sc = max(1.0, np.percentile(rgb, 99.5))
@@ -195,9 +222,9 @@ def main(a):
                 img = img[28:, 72 if img.shape[1] == 2592 else 0:]   # live119: 2400-wide shell crop has no OB columns
                 img = img[:img.shape[0] // 2 * 2]
             else:
-                M.fix_af(img, 127, geom='3x3')
+                M.fix_af(img, int(round(black_lv)), geom='3x3')
                 img = img[28:28 + 1156, 84:]
-            X.write_dng(os.path.join(a[2], 'f%05d.dng' % k), img, 'RGGB', [127.5] * 4, 1023, [0.48, 1.0, 0.66], scale_x=1)
+            X.write_dng(os.path.join(a[2], 'f%05d.dng' % k), img, 'RGGB', [black_lv] * 4, white_lv, [0.48, 1.0, 0.66], scale_x=1)
         print('DNG ->', a[2])
 
 

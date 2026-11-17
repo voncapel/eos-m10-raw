@@ -116,3 +116,24 @@ The magnifier is a crop. The goal moved to the full sensor width in Film mode.
 - v164-v166: an on-screen thumbnail built from our own RAW instead.
 - live122: export tools for editing apps (`tools/m10export.py`: CinemaDNG, or ProRes 4444
   LogC3 / ARRI Wide Gamut 3).
+
+## 6. True 14-bit in the magnifier (v167-v176, 2026-11-14 to 11-17)
+
+- v167: 24p profiles (24.000 fps by lengthening the TgPixelRes copy), RAW zebras, tail drain at
+  stop, split MLV headers.
+- r125-r126: the pre-processor tap selects what PACK32 sends. `0x12` (DEFOE, used so far) and
+  `0x22` (PREFIFO) carry a digital gain with missing codes; `0x10` (HEAD) gives unity 14-bit data.
+  Canon's encoder already crops a 14-bit source natively, so a 1920- or 2048-wide crop keeps its
+  input under 4 MiB (two CH12 blocks). First continuous 14-bit take: 1920 × 1104, 25p, 100/100.
+- v171: a 14-bit Huffman table (`M10HUF14.BIN`) instead of the 10-bit one: −25 % per frame
+  (the 10-bit table produced long codes and `0xff 0x00` stuffing). Black 2048 in RAWI.
+- r127-r128: `0x10` HEAD at 24.000p: 150/150 frames at 1920 and at 2048 wide, 0 drops,
+  ~2.2 MB per frame, encoder 39.4 ms of the 41.7 ms frame.
+- v172-v173: in-camera head-error repair. A frame hit by a head error is replaced by the previous
+  frame's payload with no copy (logical→physical slot map); only the writer patches the MLV frame
+  number and timestamp. Validated on 4 × 150 frames 2048 × 1104 14-bit, 0 drops.
+- v174-v176: shell UI rebuilt: HUD with timer, card minutes and battery, manual ISO / Tv /
+  aperture, 14-bit profiles first (`24p 2K 14b` default), HUD redrawn during REC, exit by holding
+  MENU 1 s (gives the keys back to Canon).
+- r135-r136: the `0x10` tap in Film 1×3 still gives short frames with a head error per pass.
+  14-bit stays a magnifier feature for now.

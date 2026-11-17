@@ -1,57 +1,46 @@
 # Handoff
 
-Where the work stopped (module v166, 13 November 2026), what is still open, and what has
+Where the work stopped (module v176, 17 November 2026), what is still open, and what has
 already been tried, so you don't spend a week re-testing it. Read
 [ARCHITECTURE.md](ARCHITECTURE.md) first if the register names below mean nothing yet.
 
 ## State of the camera and card
 
-The card holds CHDK 1.7 for 110d, `CHDK/MODULES/m10cine.flt` (v166),
-`CHDK/SCRIPTS/M10SHELL.LUA` set to autostart, `A/M10SH.CFG` (shell marker) and
-`A/M10HUF.BIN`. The shell installs everything it needs at start and removes it on exit or
-when a USB cable is plugged in, so the camera boots like a stock camera with CHDK.
+The card holds CHDK 1.7 for 110d, `CHDK/MODULES/m10cine.flt` (v176),
+`CHDK/SCRIPTS/M10SHELL.LUA` set to autostart, `A/M10SH.CFG` (shell marker; rename it to
+`A/M10SH.OFF` to keep the shell off during USB sessions), `A/M10HUF.BIN` and `A/M10HUF14.BIN`.
+The shell installs everything it needs at start and removes it on exit or when a USB cable is
+plugged in, so the camera boots like a stock camera with CHDK.
 
-What v164-v166 added after the last host-driven tests:
+What changed since v166 (details in HISTORY section 6):
 
-- v164: a "radar" in the magnifier showing the recorded window against what the LCD shows.
-  Replaced in v166.
-- v165-v166: a live preview made from our own RAW capture (no encoder, no card), 172 × 80 B&W
-  thumbnail in the bottom-right corner, about 10 fps. Canon's live view stays visible for
-  focusing. MENU toggles it. The preview only runs between takes.
+- 14-bit capture from the pre-processor `0x10` (HEAD) tap: unity gain, no missing codes. The
+  encoder reads a 1920- or 2048-wide crop (< 4 MiB of input), compressed with the 14-bit
+  Huffman table. This replaced the "10-bit coded as 14-bit << 4" path, which wasted ~40 % of
+  the file, and solved most of the card-bandwidth problem below.
+- 24.000 fps profiles. `24p 2K 14b` (2048 × 1104) is the default: encoder 39.4 ms of 41.7,
+  ~53 MB/s to the card.
+- In-camera head-error repair (v173): the hit frame reuses the previous payload with no copy,
+  the writer patches the frame number and timestamp. 4 × 150 frames, 0 drops.
+- Shell (v174-v176): HUD, ISO / Tv / aperture, MENU held 1 s to quit.
 
-Field log of four v165/v166 takes (2304 × 1076):
-
-| take | frames | dropped | avg size | encoder |
-|---|---:|---:|---:|---:|
-| 1 | 332 | 37 | 3.03 MB | 31.1 ms |
-| 2 | 589 | 172 | 3.55 MB | 31.1 ms |
-| 3 | 689 | 11 | 2.81 MB | 31.1 ms |
-| 4 | 1062 | 0 | 2.09 MB | 31.0 ms |
-
-The encoder keeps up every time. Drops track frame size: above about 3 MB per frame
-(75 MB/s) the card falls behind and the 9-slot compressed ring overflows. This is the main
-open problem.
+Not yet done: takes longer than 150 frames in 14-bit from the stand-alone shell (all 14-bit
+qualification so far was host-driven), and a hand test of the aperture field in ×5.
 
 ## Open problems, in the order I would attack them
 
-### 1. Card bandwidth on detailed scenes
+### 1. Long 14-bit takes from the shell
 
-The SD bus tops out around 73-80 MB/s, and Canon already runs it at its fastest clock setting
-(see live119 in HISTORY). The encoder output is inflated by the hardware: 10-bit samples are
-coded as 14-bit values << 4, which costs about 40 % of the file. Options not yet tried:
+Run the default profile for 1-2 minutes without USB on varied scenes and read the module log:
+drops, head errors, encoder max. The encoder margin is only ~2 ms at 2048 wide; `24p 1920 14b`
+(37.0 ms) is the fallback. Card bandwidth (73-80 MB/s, see live119) is no longer the limit at
+~53 MB/s. The 10-bit profiles above 2304 wide still drop on detailed scenes for that reason.
 
-- A bigger compressed ring. EXMEM is capped at 48 MiB by the config parser. The allocator
-  can go lower than we use (FIRMUP pool down to `0x59158000`); more slots only buy seconds,
-  though, not throughput.
-- An adaptive crop: drop to a narrower `EW` when the backlog passes a threshold, and record the
-  change in the MLV. Ugly for editing.
-- The Magic Lantern digital-gain trick. ML fakes lower bit depths by reducing the
-  pre-processing digital gain and capturing 14 bits, so the top bits are zero. Here the encoder
-  is bounded by bytes read (RD1), so 14-bit input would be slower than the frame period.
-  Probably dead, but nobody measured 12-bit + gain in the magnifier.
-- Huffman tables tuned per scene. Worth about 4 %, and cheap.
-- Deliberate frame skipping: drop every Nth frame cleanly when the backlog is high and write
-  a duplicate-frame marker, instead of losing frames in bursts.
+### 1b. 14-bit outside the magnifier
+
+The `0x10` tap in Film 1×3 gave a head error on every pass and short frames (~1003-1036 lines,
+r135-r136), where the 10-bit `0x12` recipe gave 300/300. A control run with `RSEL=0` at 14-bit
+is still missing before concluding.
 
 ### 2. Lines beyond 1104 in the magnifier (the height wall)
 

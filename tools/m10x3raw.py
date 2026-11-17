@@ -29,7 +29,7 @@ def cfg_tail():
     """live109: optional CFG fields 21+ (module v97-v130), emitted up to the last one set."""
     E = os.environ
     fields = [('UNPK', '0'), ('JP', 'a0:0'), ('WR2', '9'), ('EWIN', '0 0'), ('ERD', '35'), ('EH', '0'),
-              ('W2', '0 0'), ('EP', '0:0'), ('NS', '1 0 0'), ('SW', '0 0 256'), ('EMODE', '1'), ('ROWM', '1'), ('PRM', '0 0'), ('EW', '0'), ('RDB', '0'), ('EWS', '0'), ('KW', '8000'), ('EOFF', '0'), ('SWE', '0'), ('HBN', '6'), ('CHASE', '0'), ('U371', '0'), ('EBITS', '0'), ('RDF', '0'), ('HER', '0'), ('EXM', '16'), ('PBL', '0'), ('SKICK', '0'), ('TSK', '0')]
+              ('W2', '0 0'), ('EP', '0:0'), ('NS', '1 0 0'), ('SW', '0 0 256'), ('EMODE', '1'), ('ROWM', '1'), ('PRM', '0 0'), ('EW', '0'), ('RDB', '0'), ('EWS', '0'), ('KW', '8000'), ('EOFF', '0'), ('SWE', '0'), ('HBN', '6'), ('CHASE', '0'), ('U371', '0'), ('EBITS', '0'), ('RDF', '0'), ('HER', '0'), ('EXM', '16'), ('PBL', '0'), ('SKICK', '0'), ('TSK', '0'), ('RSEL', '0'), ('HEFIX', '0')]
     last = max([i for i, (k, d) in enumerate(fields) if E.get(k)] or [-1])
     return ''.join(' ' + (E.get(k) or d) for k, d in fields[:last + 1])
 
@@ -64,9 +64,11 @@ def main(a):
     zoom = mode == 'zoom'                       # live115: x5 magnifier (entered by touch): never change the mode over USB
     if zoom:
         h = c.shadow(0xc0f06804)
-        if h != 0x045702a6:
+        # v168z: also a tall magnifier left by m10zoomtall.py ... keep (6804 = H<<16 | 0x2a6, H 1111..1300);
+        # needs module >= v168z on the card (older modules only accept 045702a6)
+        if (h & 0xffff) != 0x2a6 or not 1111 <= (h >> 16) <= 1300:
             say('not in the x5 magnifier (6804=%08x), abort' % h); c.close(); return
-        say('zoom x5 (no mode change)'); hits = 1
+        say('zoom x5 (no mode change) H=%d' % (h >> 16)); hits = 1
     elif os.environ.get('NOMODE'):              # live100: capture in the current state (no M -> Film commit)
         say('nomode (keep current 1x3 state)')
         hits = 1

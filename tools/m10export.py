@@ -19,7 +19,8 @@ ProRes log: in DaVinci Resolve, set the clip's input to "ARRI LogC3 / ARRI Wide 
 use the "ARRI LogC3 to Rec709" LUT. Middle grey sits at the LogC3 EI 800 grey level (0.391).
 CinemaDNG: import the folder in Resolve (Camera RAW tab: white balance, exposure, then any log).
 
-Per frame (both modes): LJ92 decode, head-error repair (m10ljmlv.repaired), black 127.5, white 1023.
+Per frame (both modes): LJ92 decode, head-error repair (m10ljmlv.repaired), black / white read from the
+MLV RAWI block (10-bit takes: 127.5 / 1023; 14-bit takes, v171+: 2048 / 16383).
 ProRes adds: bilinear demosaic, white balance, camera -> AWG3 matrix (DNG ColorMatrix of the
 EOS M10), saturated pixels -> neutral, LogC3 encode, 10-bit 4:4:4.
 """
@@ -30,8 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import m10ljmp4 as P
 import m10mlv as M
 import m10raw2dng as R
+import m10ljmlv as L
 
-BLACK, WHITE = 127.5, 1023.0
+BLACK, WHITE = 127.5, 1023.0   # 10-bit defaults; main() replaces them with the take's RAWI values
 CLIP = WHITE - BLACK        # live122: x5 shell takes clip at 1023 (the 940 of the 3x3 Film mode cut 0.15 stop)
 KNEE = 0.80                 # soft roll to neutral from 80 % of the clip point (no flat white patches)
 DAYLIGHT = np.array([0.48, 1.0, 0.66])
@@ -118,7 +120,7 @@ def grey_world(frames):
     for a in frames:
         x = a.astype(np.float32) - BLACK
         r, g, b = x[0::2, 0::2], (x[0::2, 1::2] + x[1::2, 0::2]) / 2, x[1::2, 1::2]
-        ok = (r < CLIP * 0.9) & (g < CLIP * 0.9) & (b < CLIP * 0.9) & (g > 8)
+        ok = (r < CLIP * 0.9) & (g < CLIP * 0.9) & (b < CLIP * 0.9) & (g > CLIP / 128)
         acc += [r[ok].mean(), g[ok].mean(), b[ok].mean()]
     return acc / acc[1]
 
@@ -126,7 +128,10 @@ def grey_world(frames):
 def main(a):
     if len(a) < 2 or a[0] not in ('prores', 'dng'):
         print(__doc__); return 2
+    global BLACK, WHITE, CLIP
     mode, mlv = a[0], a[1]
+    bpp, BLACK, WHITE = L.mlv_info(mlv)
+    WHITE = float(WHITE); CLIP = WHITE - BLACK
     files = chunks(mlv)
     base = os.path.splitext(os.path.basename(mlv))[0]
     out = a[2] if len(a) > 2 else os.path.join(os.path.dirname(mlv) or '.', base + ('_LogC3.mov' if mode == 'prores' else '_CDNG'))
@@ -135,7 +140,7 @@ def main(a):
     last = int(os.environ['LAST']) if os.environ.get('LAST') else None
     ev = float(os.environ.get('EV', '0')); head = float(os.environ.get('HEAD', '4'))
     wbmode = os.environ.get('WB', 'daylight')
-    print('%s: %s -> %s' % (mode, ' + '.join(os.path.basename(f) for f in files), out), flush=True)
+    print('%s: %s -> %s  (%d-bit, black %.1f, white %d)' % (mode, ' + '.join(os.path.basename(f) for f in files), out, bpp, BLACK, WHITE), flush=True)
 
     src = (active(img) for k, img in P.chained(files, first, last))
     neutral = DAYLIGHT

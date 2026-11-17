@@ -1,6 +1,42 @@
 /*
  * m10_cine.flt - EOS M10 (fw 1.10d) RAW video.
  *
+ * v176 (2026-11-16): Aperture field (F): CHDK shooting_set_av96_direct + Canon MoveIrisWithAv
+ *   (0xfc43f6b9, CAM_AV_OVERRIDE_IRIS_FIX path), AUTO = untouched. Exit = hold MENU 1 s (MENU+SET
+ *   kept); SET/REC ignored while MENU is down. On exit: exit_alt() so Canon gets the keys back and
+ *   A/M10SH.END written so the autostart script ends.
+ * v175 (2026-11-16): HUD kept during a take: M10Key redraws the whole HUD (bars + timer) at 1 Hz
+ *   instead of the timer alone, and logs once if the overlay RAM was found erased.
+ * v174 (2026-11-16): Shell UI revamp. CHDK OSD off in the shell; one top status bar (REC dot +
+ *   timer, profile, card minutes, battery) and one bottom bar (ISO / Tv / profile / zebras /
+ *   preview size), centre toasts. Pad: UP/DOWN field, LEFT/RIGHT value. Manual ISO / shutter forced
+ *   at the sensor through the SIO hook (CMOS 0 gain, TG 805f/8061 end line), magnifier-safe (r133).
+ *   Preview thumbnail or full frame. Recipe = r132 qualified 2K 14-bit HEFIX line.
+ * v173 (2026-11-16): Zero-copy HEFIX: logical frame-to-compressed-slot map,
+ *   retain preceding payload, scan outstanding maps before encode allocation,
+ *   writer alone stamps shared VIDF header before SD write. Avoids the measured
+ *   563 ms uncached memcpy per repaired frame in r130 (59 frames / 91 drops).
+ * v172b (2026-11-16): Correct duplicate queue ordering, single-owner collection,
+ *   late-error discard, bounded mixed tail drain and pin-on-timeout. Host C regressions.
+ *   NOT hardware qualified yet; supersedes the first v172 build.
+ * v172 (2026-11-16): In-camera HEAD_ERR frame replacement + 14-bit 0x10 shell profiles:
+ *   - x_he_fix (59th CFG field HEFIX, always on in shell REC): when HEAD_ERR fires on frame fr,
+ *     skip JpCore on the torn raw frame; if fr == 0 drop it, else lj_task duplicates the
+ *     previous healthy compressed VIDF slot with updated timestamp/frameNumber (0-stall in capture).
+ *   - sh_profs[]: add bpp and rsel fields; include 24p 2K 14b (2048x1104 0x10), 24p 1920 14b,
+ *     and 25p 1920 14b alongside 10-bit profiles (live preview remains 10-bit).
+ * v171 (2026-11-16): 14-bit Huffman table (A/M10HUF14.BIN) + 14-bit black level:
+ *   - Load A/M10HUF14.BIN when lvn_bpp == 14 (avoids ~33% bloat / 0xff stuffing from 10b M10HUF.BIN).
+ *   - Fix RAWI black level to 128u << (bpp - 10) (2048 at 14-bit).
+ * v170 (2026-11-16): 14-bit cropped lossless REC + 2-block CH12 (yn=1) + args[3] stride.
+ *
+ * v167 (2026-11-14): REC timing + tail drain + split MLV headers + 24p/framing profiles + RAW zebras:
+ *   - Gate ea_take(0)/hs_take on x_diag (no 120 ms frame-4 stall) and keep pre-capture xr_tick in lj_on mode.
+ *   - Drain remaining captured frames (lj_cnt < xr_prod) in lj_drain() on REC stop before xr_stop = 1.
+ *   - Patch MLVI GUID, fileCount, and per-chunk videoFrameCount on .MLV/.M00.. splits (mlv_finalize).
+ *   - Set SH_RECIPE x_need = 1102 so incomplete st == 3 short frames never pass REC or preview.
+ *   - Shell presets cycled via LEFT/RIGHT (24.000 fps fl=1819 per=41666 us: 2304/2512/2048/1920, plus 25p 2304),
+ *     adaptive pv_render()/sh_radar(), and UP-toggled channel clipping zebras (>= 1020) in preview.
  * v166 (2026-11-13): preview = 172 x 80 thumbnail bottom right (Canon LV kept for focus), radar removed.
  * v165 (2026-11-13): shell live preview in the x5 magnifier: our own 10-bit capture (no encoder, no card),
  *   recorded window 2304 x 1076 sampled 2x2 to B&W on the CHDK overlay (360 x 168), ~10 fps, auto levels.
@@ -254,6 +290,7 @@
 #include "battery.h"
 #include "sd_card.h"
 #include "debug_led.h"
+#include "stdio.h"
 
 // ---- firmware 1.10d addresses (Thumb, +1) ----
 #define FN_RES_LOCK    0xfc373f9f
@@ -323,9 +360,12 @@ static cine_hdr hdr;
 static char slog_buf[SLOG_BUF];
 static unsigned slog_len = 0, slog_lost = 0, slog_defer = 0;
 static volatile unsigned sh_on = 0, sh_stop_req = 0;   // v160 shell
+static volatile unsigned sh_quit_req = 0;              // v176: MENU held 1 s
 static volatile unsigned sh_pv = 0, sh_pv_key = 0, sh_pv_n = 0, sh_pv_off = 0;   // v165: live preview from our RAW (shell, x5)
-// v160: zoom REC recipe = r116_m1 (live117): 1104 lines, 10 bit, LJ92, EXM 48, 25 fps, he recovery
-#define SH_RECIPE "3000 1104 10 0 0 553650560 0 80000003 5000 11000 6 0 0 12 4 99 0 0 11 0 0 a0:0 9 0 0 35 0 0 0 0:0 1 0 2 0 0 256 1 1 0 0 2304 0 0 8000 240 0 16 0 0 0 0 1 48 0 1\n"
+// v167: zoom REC recipe base (r116_m1 + x_need=1102 guard against short/empty frames); width/crop overridden by sh_profs
+// v174: = r132 qualified line (m10x3raw.py zoom ... HEFIX=1 RSEL=10 CSH=0 ENC=11 EXM=48 HBN=16 HER=1 SKICK=1 NS='1 0 2'
+//   KW=8000), with 3000 frames, x_need=1102 kept (short-frame guard), CSH 0 (14-bit), HBN 16.
+#define SH_RECIPE "3000 1104 14 0 0 553650560 0 80000003 5000 11000 6 1102 0 12 4 99 0 0 11 0 0 a0:0 9 0 0 35 0 0 0 0:0 1 0 2 0 0 256 1 1 0 0 2048 0 0 8000 532 0 16 0 0 0 0 1 48 0 1 0 10 1\n"
 static void slog(const char *fmt, unsigned a, unsigned b)
 {
     char t[96];
@@ -1063,7 +1103,7 @@ static unsigned enc_frame(char *buf, unsigned phys, unsigned in_off, unsigned *e
     list[0] = out; list[1] = enc_out_size;
     memset(args, 0, sizeof(args));
     args[0] = enc_w; args[1] = enc_h; args[2] = phys + enc_in_off + in_off;
-    args[3] = enc_w; args[6] = enc_bits;
+    args[3] = (enc_wov && !enc_wstride) ? x_w : enc_w; args[6] = enc_bits;
     args[7] = phys + enc_wr2_off; args[9] = 1; args[10] = (unsigned)list;
     args[11] = 0x54; args[12] = 0x3e; args[13] = enc_w2w ? enc_w2w : enc_w; args[14] = enc_w2h ? enc_w2h : enc_h;   // v110: WR2 (preview) size
     args[15] = 5; args[18] = enc_huff_ok ? (unsigned)enc_huff : LL_HUFF;   // v100
@@ -1125,7 +1165,7 @@ static unsigned enc_begin(char *buf, unsigned phys, unsigned in_off)
     list[0] = out; list[1] = enc_out_size;
     memset(args, 0, sizeof(args));
     args[0] = enc_w; args[1] = enc_h; args[2] = phys + enc_in_off + in_off;
-    args[3] = enc_w; args[6] = enc_bits;
+    args[3] = (enc_wov && !enc_wstride) ? x_w : enc_w; args[6] = enc_bits;
     args[7] = phys + enc_wr2_off; args[9] = 1; args[10] = (unsigned)list;
     args[11] = 0x54; args[12] = 0x3e; args[13] = enc_w2w ? enc_w2w : enc_w; args[14] = enc_w2h ? enc_w2h : enc_h;   // v110: WR2 (preview) size
     args[15] = 5; args[18] = enc_huff_ok ? (unsigned)enc_huff : LL_HUFF;   // v100
@@ -1815,6 +1855,9 @@ static int lvm_hold_ms = 70;
 // pipeline sleeps (cap_sleep). 1 = msleep(1) in the poll loop.
 static int lvm_sleep = 1;
 static unsigned lvn_bpp = 14, lvn_lb = LVN_LB;  // v26: lv_x3 bit depth
+// v168z (2026-11-15): the x5 magnifier with a taller head (m10zoomtall.py: 6804 = H<<16 | 0x2a6, H 1111..1300)
+// counts as zoom in lv_x3 (width 2592, lines up to H - 7) so the hold-line position can be measured.
+static int zoom_head(unsigned h) { unsigned hh = h >> 16; return (h & 0xffff) == 0x2a6 && hh >= 1111 && hh <= 1300; }
 static unsigned x_w = LVN_W, x_per = 40000, x_zoom = 0;   // v156: frame width (2592 in the x5 magnifier), frame period us, zoom flag
 static unsigned lvn_post_ms = 0;    // v33: wait after the DMA end before stop/restore
 static unsigned tl_step = 1000;     // v34: timeline spacing (us); calibration: 250 us, busy poll
@@ -1868,6 +1911,7 @@ static unsigned lj_chase = 0, lj_chased = 0, lj_chase_n = 0, lj_chase_miss = 0; 
 static volatile unsigned lj_kicked;   // v144: forward (defined with the LJ state)
 static unsigned x_dr[3];   // v126: drop reasons (ring full, he, PACK32 busy): starts the encoder on frame fr from the capture task
 static volatile unsigned lj_cnt = 0;   // v124
+static unsigned lj_on = 0, x_he_fix = 0;   // v172: forward for lvn_cap
 // v140: per-frame timeline (20-bit us, bit 31 = set): 0 CH12 armed, 1 first line moved, 2 DMA end, 3 encoder start, 4 encoder CBR, 5 SD write start, 6 SD write end
 #include "m10_tasktrace.h"
 #define TLF_N 640
@@ -2246,6 +2290,7 @@ static unsigned x_dc = 99, x_dc_saved = 0;   // v86: Canon write channel disconn
 static char *x_mcsrc = 0;
 static unsigned x_start_us = 0;  // v79: CH12 start time after 8830 (xo 0x10000000), from the 13th CFG field      // v77: memcpy source (second half of EXMEM)
 static unsigned x_px = 0, px_on = 0, px_n = 0, px_cycle = 6, px_s14 = 0, px_s74 = 0;
+static unsigned x_rsel = 0, px_s40 = 0;   // v169: 58th CFG field RSEL = raw selector for 37014/37040/37074 (0 = Canon PK_ON 0x12; 0x2e = photo path, r124)
 static unsigned px_cfg[NPK];        // PACK32 sub-registers as set by PK_ON (re-written by the reset pulse)
 static unsigned px_dirty = 0;       // last frame cut short: PACK32 may hold a partial frame
 static unsigned px_opens = 0, px_frames = 0, px_late = 0, px_rearm_err = 0, px_pulses = 0;
@@ -2276,6 +2321,14 @@ static int px_open(void)
     ch12_flags = x_chf ? x_chf : ((x_xo & 4) ? 0x1000 : 0x40000000);   // v68, v72 pack 4
     ((fn2)FN_PK_ON)(lvn_bpp, (x_xo & 4) ? 4 : 2);
     if (x_xo & 0x8000000) ((fn3)FN_ENGDRV_MASK)(0xc0f37014, ~0x3fu, 0x10);   // v78: RAW from the HEAD output (ML lv_select_raw 0x10)
+    if (x_rsel) {                      // v169: Canon photo values seen in r124: 37014[5:0]=0x2e, 37040 = 2e2e....(bits 16-21, 24-29), 37074[5:0]=0x2e, [13:8]=0x2f
+        px_s40 = shamem(0xc0f37040);
+        ((fn3)FN_ENGDRV_MASK)(0xc0f37014, ~0x3fu, x_rsel & 0x3f);
+        if (x_rsel == 0x2e) {
+            ((fn3)FN_ENGDRV_MASK)(0xc0f37040, 0xc0c0ffffu, 0x2e2e0000);
+            ((fn3)FN_ENGDRV_MASK)(0xc0f37074, ~0x3f3fu, 0x2f2e);
+        }
+    }
     if (x_xo & 0x10000) {           // v75i: EvfCaptureSystem start = PK_ON, 0xfc34d580(bpp), 0xfc34ed7a(1): 37274 bit 8
         px_s274 = shamem(0xc0f37274);
         ((fn3)FN_ENGDRV_MASK)(0xc0f37274, ~0x100u, 0x100);
@@ -2320,6 +2373,11 @@ static int px_close(void)
     ((fn3)FN_ENGDRV_MASK)(0xc0f37074, ~0x0f000000u, px_s74 & 0x0f000000);
     for (i = 0; i < NPK; i++) eng_out(pk_regs[i], pk_saved[i]);
     }
+    if (x_rsel == 0x2e) {              // v169: restore the extra fields we touched (also with xo 0x800)
+        ((fn3)FN_ENGDRV_MASK)(0xc0f37014, ~0x3fu, px_s14 & 0x3f);
+        ((fn3)FN_ENGDRV_MASK)(0xc0f37040, 0xc0c0ffffu, px_s40 & 0x3f3f0000);
+        ((fn3)FN_ENGDRV_MASK)(0xc0f37074, ~0x3f3fu, px_s74 & 0x3f3f);
+    }
     if (x_xo & 0x10000) ((fn3)FN_ENGDRV_MASK)(0xc0f37274, ~0x100u, px_s274 & 0x100);   // v75i
     if (x_xo & 0x40000000) {           // v83: re-arm Canon's head error detection (Extract 0xfc157280)
         unsigned he = *(volatile unsigned *)(0x0000fa68 + 0x1c);
@@ -2354,17 +2412,24 @@ static int ch12_abort(void)
     while (REG(CH12_BASE) != 0 && udiff(u, usec()) < 5000) ;
     return REG(CH12_BASE) == 0;
 }
-// one block of n lines into phys (CH12 must be idle)
+// one frame into phys (CH12 must be idle): 1 block if <= 4 MiB, 2 blocks (yn=1) if > 4 MiB
 static void ch12_arm(unsigned phys, unsigned n)
 {
-    unsigned off;
+    unsigned off, tot = n * lvn_lb;
     eng_out(CH12_BASE + 0x40, 0);
     eng_out(CH12_BASE + 0x04, ch12_flags);
     eng_out(CH12_BASE + 0x08, phys);
-    eng_out(CH12_BASE + 0x0c, 0);
-    eng_out(CH12_BASE + 0x14, 0);
-    if (x_rowm > 1 && !(n % x_rowm)) eng_out(CH12_BASE + 0x10, ((n / x_rowm - 1) << 16) | (lvn_lb * x_rowm));   // v131: m lines per EDMAC row (8/16-byte burst alignment)
-    else eng_out(CH12_BASE + 0x10, ((n - 1) << 16) | lvn_lb);
+    if (tot > 0x00400000) {
+        unsigned b1 = n / 2, b2 = n - b1;
+        eng_out(CH12_BASE + 0x0c, 1 << 16);
+        eng_out(CH12_BASE + 0x14, ((b1 - 1) << 16) | lvn_lb);
+        eng_out(CH12_BASE + 0x10, ((b2 - 1) << 16) | lvn_lb);
+    } else {
+        eng_out(CH12_BASE + 0x0c, 0);
+        eng_out(CH12_BASE + 0x14, 0);
+        if (x_rowm > 1 && !(n % x_rowm)) eng_out(CH12_BASE + 0x10, ((n / x_rowm - 1) << 16) | (lvn_lb * x_rowm));   // v131: m lines per EDMAC row (8/16-byte burst alignment)
+        else eng_out(CH12_BASE + 0x10, ((n - 1) << 16) | lvn_lb);
+    }
     for (off = 0x18; off <= 0x28; off += 4) eng_out(CH12_BASE + off, 0);
 }
 // PACK32 datapath reset in the blanking, as PK_ON / 0xfc34d5b6 do it (bit 31
@@ -2539,7 +2604,10 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
         *dt = udiff(u0, usec());
         x_dma_live = 0; x_dma_t1 = usec();   // v119
         if (x_early) { tlf_set(x_early_fr, 2, x_dma_t1); if (x_early_fr < TLF_N) tlf[x_early_fr][0] = REG(0xc0f58908); }   // v140 (v141: slot 0 = ch47 address at DMA end)
-        if (x_early && st == 0) { x_ready = x_early_fr + 1; if (x_kick && !lj_chased) x_kick(x_early_fr); if (lj_sem_p) GiveSemaphore(*lj_sem_p); }   // v121: frame complete in DRAM (v125: encoder started right here; v144: unless already chased)
+        if (x_early && st == 0) {
+            if (x_he_fix && lj_on && *(volatile unsigned *)(0x0000fa68 + 0x1c)) ;   // v172: HEAD_ERR handled in lv_x3 (skip JpCore)
+            else { x_ready = x_early_fr + 1; if (x_kick && !lj_chased) x_kick(x_early_fr); if (lj_sem_p) GiveSemaphore(*lj_sem_p); }
+        }   // v121: frame complete in DRAM (v125: encoder started right here; v144: unless already chased)
     }
     if (lvn_sync == 4 && (x_xo & 1) && (st == 0 || st == 3)) { if (!wait_dfe_w(80, x_dma_sio, x_hi, x_hi_post)) st = 1; }   // v72 (restore: any delay accepted)
     else if (lvn_sync == 4 && (st == 0 || st == 3)) { if (!wait_dfe(60, x_dly_us, x_dma_sio, 1)) st = 1; }   // v64: short frames too   // v62: restore at this frame's 8830 + delay
@@ -2555,9 +2623,12 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
         if (x_need && x_rx < x_need * lvn_lb) { x_short_bad++; bad = 1; }   // v73: below the accepted height
         px_dirty = 1;
         if (x_skick && x_early && !bad) {   // v151: a kept short frame was never kicked at the DMA end (st == 3): the encoder fell one frame behind for good -> raw ring full -> drop bursts
-            x_ready = x_early_fr + 1; x_skick_n++;
-            if (x_kick && !lj_chased) x_kick(x_early_fr);
-            if (lj_sem_p) GiveSemaphore(*lj_sem_p);
+            if (x_he_fix && lj_on && *(volatile unsigned *)(0x0000fa68 + 0x1c)) ;   // v172
+            else {
+                x_ready = x_early_fr + 1; x_skick_n++;
+                if (x_kick && !lj_chased) x_kick(x_early_fr);
+                if (lj_sem_p) GiveSemaphore(*lj_sem_p);
+            }
         }
     }
     else if (st) ok = 0;
@@ -3018,14 +3089,16 @@ static unsigned x_enc = 0;   // v92: 20th CFG field: run the lossless encoder on
 static unsigned x_skipy = 0;            // v90: RAWC skipping_y (0 = 1x3 all lines, 2 = Film 3x3: 1 line of 3), 18th CFG field
 static unsigned lj_eoff;   // v159: tentative (defined with the LJ state below)
 static unsigned mlv_crop = 0;   // v159: MLV describes the encoder window (EW/EH/EOFF), not the whole frame
+static unsigned mlv_guid_lo = 0;
 static void mlv_build_hdr(unsigned w, unsigned h, unsigned bpp, unsigned nframes)
 {
     static const int cm[9] = { 6400, -480, -888, -5294, 13416, 2047, -1296, 2203, 6137 };
     unsigned char *p = mlv_hdr, *q;
     unsigned i, pitch = w * bpp / 8, used;
+    if (!mlv_guid_lo) mlv_guid_lo = get_tick_count();
     memset(mlv_hdr, 0, sizeof(mlv_hdr));
     memcpy(p, "MLVI", 4); put32(p + 4, 52); memcpy(p + 8, "v2.0", 4);
-    put32(p + 16, get_tick_count()); put32(p + 20, 0x4d313078);      // GUID
+    put32(p + 16, mlv_guid_lo); put32(p + 20, 0x4d313078);           // persistent GUID across chunks
     put16(p + 24, 0); put16(p + 26, 1); put32(p + 28, 0);
     put16(p + 32, 1); put16(p + 34, 0);                                // RAW, no audio
     put32(p + 36, nframes); put32(p + 40, 0); put32(p + 44, mlv_fps1000); put32(p + 48, 1000);
@@ -3034,7 +3107,7 @@ static void mlv_build_hdr(unsigned w, unsigned h, unsigned bpp, unsigned nframes
     put16(q, w); put16(q + 2, h); q += 4;
     put32(q, 1); put32(q + 4, 0); put32(q + 8, h); put32(q + 12, w); put32(q + 16, pitch);
     put32(q + 20, pitch * h); put32(q + 24, bpp);
-    put32(q + 28, 127u << (bpp - 10)); put32(q + 32, (1u << bpp) - 1);
+    put32(q + 28, 128u << (bpp - 10)); put32(q + 32, (1u << bpp) - 1);
     put32(q + 36, 0); put32(q + 40, 0); put32(q + 44, w); put32(q + 48, h);       // crop
     {   // active y1 x1 y2 x2 (v90: Film 3x3 rows 3-27 = optical black -> y1 = 28)
         unsigned y1 = (x_skipy || x_zoom) ? 28 : 4, x1 = 72;   // v159: zoom has 28 optical-black rows too
@@ -3065,26 +3138,60 @@ static void mlv_frame_hdr(unsigned char *p, unsigned k, unsigned fb, unsigned ts
     memcpy(p, "NULL", 4); put32(p + 4, xr_nullsz); put32(p + 8, 0); put32(p + 12, 0);
 }
 
-static unsigned xr_fbytes, xr_fileno, xr_fcount[16];
+static unsigned xr_fbytes, xr_fileno, xr_fcount[16], xr_chunk_start = 0;
 static char xr_base[16] = "A/M10X3";   // v160: take base name (A/M10_0001 in shell mode)
 static void xr_roll(void)                   // v57: FAT32: < 4 GiB per file, ML-style chunks
 {
-    char nm[20];
+    char nm[24];
     close(xr_fd);
-    if (xr_fileno < 16) xr_fcount[xr_fileno] = xr_wr;
+    if (xr_fileno < 16) { xr_fcount[xr_fileno] = xr_wr - xr_chunk_start; xr_chunk_start = xr_wr; }
     xr_fileno++;
-    sprintf(nm, "%s.M%02d", xr_base, xr_fileno - 1);
+    sprintf(nm, "%s.M%02u", xr_base, xr_fileno - 1);
     xr_fd = open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0777);
     if (xr_fd < 0) { xr_err = 2; return; }
-    put16(mlv_hdr + 24, xr_fileno);         // fileNum; fileCount fixed by the host tool (same GUID)
+    put16(mlv_hdr + 24, xr_fileno);
+    put32(mlv_hdr + 36, 0);
     write(xr_fd, mlv_hdr, 512);
     xr_fbytes = 512;
+}
+static void mlv_finalize(unsigned w, unsigned h, unsigned bpp, int lj_class)   // v167: write finalized fps, fileCount and per-chunk videoFrameCount
+{
+    unsigned nfiles = xr_fileno + (xr_fd >= 0 ? 1 : 0), c;
+    if (xr_fileno == 0 && xr_fd >= 0) {
+        mlv_build_hdr(w, h, bpp, xr_wr);
+        if (lj_class) put16(mlv_hdr + 32, 0x21);
+        lseek(xr_fd, 0, SEEK_SET);
+        write(xr_fd, mlv_hdr, 512);
+        close(xr_fd);
+        xr_fd = -1;
+        return;
+    }
+    if (xr_fd >= 0) {
+        if (xr_fileno < 16) xr_fcount[xr_fileno] = xr_wr - xr_chunk_start;
+        close(xr_fd);
+        xr_fd = -1;
+    }
+    if (nfiles > 16) nfiles = 16;
+    if (!nfiles) return;
+    mlv_build_hdr(w, h, bpp, 0);
+    if (lj_class) put16(mlv_hdr + 32, 0x21);
+    put16(mlv_hdr + 26, nfiles);
+    for (c = 0; c < nfiles; c++) {
+        char nm[24];
+        FILE *f;
+        if (c == 0) sprintf(nm, "%s.MLV", xr_base);
+        else sprintf(nm, "%s.M%02u", xr_base, c - 1);
+        put16(mlv_hdr + 24, c);
+        put32(mlv_hdr + 36, xr_fcount[c]);
+        f = fopen(nm, "r+b");
+        if (f) { fseek(f, 0, SEEK_SET); fwrite(mlv_hdr, 1, 512, f); fclose(f); }
+    }
 }
 // v101: compressed REC. Raw ring: xr_nslot slots of xr_fb bytes from buf (captured by lvn_cap).
 // Encoder task: raw slot k -> compressed ring slot (MLV VIDF header + LJ92 + NULL padding to 512),
 // lj_cnt = frames encoded; the writer then writes compressed slots. Capture drops a frame if the
 // raw slot it would overwrite is not yet encoded.
-static unsigned lj_on = 0, lj_raw_n, lj_cslot_sz, lj_cslot_n, lj_cbase, lj_gate = 0;   // v103
+static unsigned lj_raw_n, lj_cslot_sz, lj_cslot_n, lj_cbase, lj_gate = 0;   // v103
 static unsigned lj_wlo = 0, lj_whi = 0, lj_ph[512];   // v105: encoder start window (us after 8830), start phase per frame
 static volatile unsigned lj_err = 0, lj_done = 0;   // v124: lj_cnt moved up
 #define LJ_N 512
@@ -3120,16 +3227,37 @@ static unsigned x_her = 0;         // v148: 53rd field = 1: no-pause head-error 
 #define HE_ALL_N 1024
 static unsigned x_he_all[HE_ALL_N];   // v148: every trapped error: (frame << 8) | status, written to A/M10HE.BIN
 static unsigned x_he_late = 0;     // v148: failed passes absorbed right after an error (old wait used instead)
+static unsigned x_he_fixed = 0, x_dup_us_max = 0;   // v172: 59th field (or shell): duplicate prev healthy frame on HEAD_ERR
+static volatile unsigned lj_prev_sz = 0, lj_prev_tot = 0;
+#define LJ_DUP_N 16
+static volatile unsigned lj_dup_q[LJ_DUP_N], lj_dup_h = 0, lj_dup_t = 0;
+// v173: logical frames may share an immutable compressed payload. Only the
+// writer patches its header, immediately before the synchronous SD write.
+#define LJ_MAP_N 16
+static volatile unsigned lj_map[LJ_MAP_N];
+static unsigned lj_slot(unsigned k) { return x_he_fix ? lj_map[k % lj_cslot_n] : k % lj_cslot_n; }
+static unsigned lj_free_slot(void)
+{
+    unsigned cs, j, wr = xr_wr;   // stale lower wr only retains extra slots
+    for (cs = 0; cs < lj_cslot_n; cs++) {
+        if (lj_cnt && cs == lj_slot(lj_cnt - 1)) continue;   // retain predecessor even after SD write
+        for (j = wr; j < lj_cnt; j++) if (lj_slot(j) == cs) break;
+        if (j == lj_cnt) return cs;
+    }
+    return lj_cslot_n;
+}
 
 static void lj_vidf(unsigned k, unsigned sz)   // v127: VIDF header + NULL padding of compressed frame k
 {
-    unsigned cs = k % lj_cslot_n;
+    unsigned cs = lj_slot(k);
     unsigned char *h = lj_buf + lj_cbase + cs * lj_cslot_sz;
     unsigned tot = (512 + sz + 16 + 511) & ~511u, nul = tot - 512 - sz;
     memset(h, 0, 512);
     memcpy(h, "VIDF", 4); put32(h + 4, 512 + sz); put32(h + 8, (xr_tick[k]) * 1000); put32(h + 16, k); put32(h + 28, 480);
     h += 512 + sz; memcpy(h, "NULL", 4); put32(h + 4, nul); put32(h + 8, 0); put32(h + 12, 0);
     if (k < XR_MAX) xr_wus[k] = tot;
+    lj_prev_sz = sz;
+    lj_prev_tot = tot;
 }
 static int lj_collect(void)   // v127: finish the kicked encode if its CBR came; 1 = done (or none), 0 = still running, -1 = error
 {
@@ -3142,10 +3270,42 @@ static int lj_collect(void)   // v127: finish the kicked encode if its CBR came;
     lj_kicked = 0;
     if (k < LJ_N) { lj_sz[k] = sz; lj_us[k] = eus; }
     if (!sz) { lj_err = 2; return -1; }
+    // v172b: a late HEAD_ERR may be registered after the early kick. Discard
+    // that completed output; only the capture task collects, so it cannot
+    // publish the bad frame before lv_x3 has registered the replacement.
+    if (lj_dup_t < lj_dup_h && lj_dup_q[lj_dup_t % LJ_DUP_N] == k) {
+        GiveSemaphore(lj_sem);
+        return 1;
+    }
     lj_vidf(k, sz);
     lj_cnt = k + 1;
     GiveSemaphore(xr_sem);
     return 1;
+}
+static void lj_kick(unsigned fr);
+static void lj_drain(void)   // v167: flush remaining captured frames (lj_cnt < xr_prod) before xr_stop exits lj_task
+{
+    unsigned t = get_tick_count();
+    while (lj_kicked && !cb_done && get_tick_count() - t < 3000) msleep(5);
+    if (lj_kicked && !cb_done) { lj_err = 4; return; }
+    lj_collect();
+    if ((int)xr_prod > (int)x_ready) x_ready = xr_prod;
+    while ((lj_cnt < xr_prod || lj_dup_t < lj_dup_h) && !lj_err && !xr_err && get_tick_count() - t < 10000) {
+        unsigned before = lj_cnt;
+        while ((int)(lj_cnt - xr_wr) >= (int)lj_cslot_n && !xr_err && get_tick_count() - t < 10000) {
+            GiveSemaphore(xr_sem); msleep(5);
+        }
+        if (xr_err) break;
+        lj_kick(lj_cnt);   // v172b: normal older frames may precede a queued duplicate
+        if (lj_kicked) {
+            while (!cb_done && get_tick_count() - t < 10000) msleep(2);
+            if (!cb_done) { lj_err = 4; break; }
+            lj_collect();
+        } else if (lj_dup_t < lj_dup_h) {
+            GiveSemaphore(lj_sem); msleep(2);
+        } else if (lj_cnt == before && lj_cnt < xr_prod) { lj_err = 5; break; }
+    }
+    if (!lj_err && !xr_err && (lj_cnt < xr_prod || lj_dup_t < lj_dup_h)) lj_err = 5;
 }
 static void lj_kick(unsigned fr)
 {
@@ -3153,11 +3313,19 @@ static void lj_kick(unsigned fr)
     { unsigned u0w = usec(); int rc;   // v138: previous encode often ends 0-5 ms after our DMA end: wait for it instead of skipping the kick
       while ((rc = lj_collect()) == 0 && udiff(u0w, usec()) < lj_kwait) ;
       if (rc <= 0) { lj_k_no[0]++; return; } }   // v127: previous one still running (or failed)
+    if (lj_dup_t < lj_dup_h && lj_cnt >= lj_dup_q[lj_dup_t % LJ_DUP_N]) {
+        // v172b: do not sleep in the capture path or block older good frames.
+        // The worker publishes the duplicate before any subsequent encode.
+        GiveSemaphore(lj_sem);
+        return;
+    }
     if (lj_ns != 1 || lj_kicked) { lj_k_no[0]++; return; }
     fr = lj_cnt;   // v126: oldest frame not yet encoded
     if (fr >= x_ready) { lj_k_no[1]++; return; }
     if (fr - xr_wr >= lj_cslot_n || fr >= XR_MAX) { lj_k_no[2]++; return; }   // only the next frame, one at a time, output slot free
-    rs = xr_slot[fr] % lj_raw_n; cs = fr % lj_cslot_n;
+    rs = xr_slot[fr] % lj_raw_n; cs = x_he_fix ? lj_free_slot() : fr % lj_cslot_n;
+    if (cs >= lj_cslot_n) { lj_k_no[2]++; return; }
+    if (x_he_fix) lj_map[fr % lj_cslot_n] = cs;
     enc_in_off = rs * xr_fb + lj_eoff; enc_out_off = lj_cbase + cs * lj_cslot_sz + 512; enc_out_size = lj_cslot_sz - 1024;   // v139: + source offset (active area only)
     { unsigned uk = usec();
     if (enc_begin((char *)lj_buf, lj_phys, 0)) { lj_kicked = fr + 1; lj_k_ok++; tlf_set(fr, 3, enc_u0); } else lj_k_no[3]++;   // v140
@@ -3166,9 +3334,29 @@ static void lj_kick(unsigned fr)
 static void lj_task(void)
 {
     for (;;) {
-        if (x_kick) {   // v127: kick mode: the capture task starts and collects; here only a fallback collect
-            if (lj_kicked && cb_done && xr_stop) lj_collect();
-            if (xr_stop && !lj_kicked) break;
+        if (x_kick) {   // v127: kick mode: the capture task starts and collects; v172: also copies HEAD_ERR duplicate slots
+            while (lj_dup_t < lj_dup_h && !lj_err && !xr_err) {
+                unsigned df = lj_dup_q[lj_dup_t % LJ_DUP_N];
+                // v172b: capture is the sole encoder collector. Never wait here
+                // for an older unstarted encode; it must be allowed to run first.
+                if (lj_cnt < df || lj_kicked) break;
+                if (lj_cnt != df || !df || lj_cslot_n < 2 || !lj_prev_tot || lj_prev_tot > lj_cslot_sz) { lj_err = 6; break; }
+                if ((int)(df - xr_wr) >= (int)lj_cslot_n) { GiveSemaphore(xr_sem); break; }
+                {
+                    unsigned ud0 = usec(), udt;
+                    // v173: no pixel copy, no header write while SD may read it.
+                    // Ordered kick allocation retains the immediately preceding slot.
+                    lj_map[df % lj_cslot_n] = lj_slot(df - 1);
+                    if (df < XR_MAX) xr_wus[df] = lj_prev_tot;
+                    if (df < LJ_N) { lj_sz[df] = lj_prev_sz; lj_us[df] = 0; }
+                    udt = udiff(ud0, usec()); if (udt > x_dup_us_max) x_dup_us_max = udt;
+                    lj_cnt = df + 1;
+                    lj_dup_t++;
+                    GiveSemaphore(xr_sem);
+                }
+            }
+            // v172b: lj_drain in the capture task owns all tail collections.
+            if (xr_stop && !lj_kicked && lj_dup_t >= lj_dup_h) break;
             if (lj_err || xr_err) break;
             TakeSemaphore(lj_sem, 20);
             continue;
@@ -3226,7 +3414,7 @@ static void xr_task(void)
 {
     for (;;) {
         if (lj_on && xr_wr < lj_cnt && !xr_err) {   // v101: compressed frames
-            unsigned k = xr_wr, cs = k % lj_cslot_n, t0 = usec(), len = (k < XR_MAX) ? xr_wus[k] : 0;
+            unsigned k = xr_wr, cs = lj_slot(k), t0 = usec(), len = (k < XR_MAX) ? xr_wus[k] : 0;
             char *p = (char *)lj_buf + lj_cbase + cs * lj_cslot_sz;
             if (xr_fbytes + len > 1900u * 1024 * 1024) xr_roll();
             if (xr_err) continue;
@@ -3236,6 +3424,9 @@ static void xr_task(void)
                 while (lj_kicked && !cb_done && !xr_err && !(xr_stop && lj_done) && get_tick_count() - tw < 60) msleep(1);
                 t0 = usec();
             }
+            // v173: writer alone mutates a shared VIDF header; xr_wr remains
+            // unchanged until every byte is written, protecting its physical slot.
+            if (x_he_fix) { put32((unsigned char *)p + 8, xr_tick[k] * 1000); put32((unsigned char *)p + 16, k); }
             tlf_set(k, 5, t0);   // v140
             if (!len) xr_err = 1;
             else if (!lj_swhi) { if (write(xr_fd, p, len) != (int)len) xr_err = 1; }
@@ -3349,14 +3540,51 @@ static unsigned hex_u32(char **pq)   // v84b: strtol saturates at 0x7fffffff
  * magnifier exit, USB or repeated capture errors. */
 #define PV_RGBA   ((unsigned *)(((0x41141000 + 960 * 270 * 3) + 0xff) & 0xffffff00))   // = lib.c CHDK_LAYER_BUF (chdk_rgba)
 #define PV_BW     360
-#define PV_W      172             // v166: thumbnail bottom right, Canon LV stays visible for focus
-#define PV_H      80
-#define PV_X      (360 - PV_W - 4)
-#define PV_Y      (240 - PV_H - 4)
+// v174: preview geometry is dynamic: thumbnail (bottom right, Canon x5 view stays visible for focus)
+// or full frame (letterboxed 2048/1920 aspect between the HUD bars); toggled by DOWN.
+static volatile unsigned pv_full = 0;
+static unsigned PV_W = 172, PV_H = 80, PV_X = 360 - 172 - 4, PV_Y = 240 - 80 - 18;
+static void pv_geom(void)
+{
+    if (pv_full) { PV_W = 352; PV_H = 184; PV_X = 4; PV_Y = 26; }
+    else         { PV_W = 160; PV_H = 82;  PV_X = 360 - 160 - 4; PV_Y = 240 - 82 - 22; }
+}
 static unsigned char pv_lut[1024];
 static int sh_usb(void);
 static void sh_gui_assert(void);
 extern void vid_bitmap_refresh();
+typedef struct {
+    unsigned char fps;
+    unsigned char bpp;
+    unsigned char rsel;
+    unsigned char pad;
+    unsigned short fl;
+    unsigned short per;
+    unsigned short c0;
+    unsigned short w;
+    const char *tag;
+} sh_prof_t;
+static const sh_prof_t sh_profs[] = {
+    { 24, 14, 0x10, 0, 1819, 41666, 304, 2048, "24p 2K 14b"   },   // 1.90:1 2K DCI 14-bit (0x10 HEAD, 1.00x unity)
+    { 24, 14, 0x10, 0, 1819, 41666, 368, 1920, "24p 1920 14b" },   // 1.78:1 16:9 14-bit (0x10 HEAD)
+    { 25, 14, 0x10, 0, 1747, 40017, 368, 1920, "25p 1920 14b" },   // 1.78:1 25p 14-bit (0x10 HEAD)
+    { 24, 10, 0x00, 0, 1819, 41666, 192, 2304, "24p 2304 10b" },   // 2.14:1 cinema 10-bit
+    { 24, 10, 0x00, 0, 1819, 41666,  80, 2512, "24p 2512 10b" },   // 2.33:1 max active 10-bit
+    { 24, 10, 0x00, 0, 1819, 41666, 304, 2048, "24p 2048 10b" },
+    { 24, 10, 0x00, 0, 1819, 41666, 368, 1920, "24p 1920 10b" },
+    { 25, 10, 0x00, 0, 1747, 40017, 192, 2304, "25p 2304 10b" },   // 25.00p PAL legacy 10-bit
+};
+#define SH_NPROF (sizeof(sh_profs) / sizeof(sh_profs[0]))
+static volatile unsigned sh_prof_idx = 0, sh_armed_fps = 0;
+static volatile unsigned pv_zebra = 1, pv_clip_pct = 0;
+static const sh_prof_t *sh_prof(void) { return &sh_profs[sh_prof_idx < SH_NPROF ? sh_prof_idx : 0]; }
+static void sh_say(const char *s1, const char *s2);
+static void sh_redraw(int force);
+static int sh_arm_fps(const sh_prof_t *pr, int update_cache);
+static int sh_handle_nav(int zoom);
+static void sh_hud(int force);
+static void sh_hud_clear(void);
+
 static unsigned pv_stat[3];                   // last frame: frames, black, mean luma (raw units)
 static inline unsigned pv_get10(const volatile unsigned short *p, unsigned c)
 {
@@ -3382,8 +3610,10 @@ static void pv_clear(void)
 }
 static void pv_render(const char *frame)
 {
-    unsigned x, y, sum = 0, n = 0, black = 0;
+    unsigned x, y, sum = 0, n = 0, black = 0, clip = 0, border;
     unsigned lb = lvn_lb;
+    const sh_prof_t *pr = sh_on ? sh_prof() : &sh_profs[0];
+    unsigned c0 = pr->c0, cw = pr->w;
     {   // black: optical black columns 8..63, rows 200 / 600
         unsigned c, s = 0;
         for (c = 8; c < 64; c += 2) {
@@ -3398,32 +3628,44 @@ static void pv_render(const char *frame)
         const volatile unsigned short *p1 = (const volatile unsigned short *)(frame + (r + 1) * lb);
         unsigned *o = PV_RGBA + (PV_Y + y) * PV_BW + PV_X;
         for (x = 0; x < PV_W; x++) {
-            unsigned c = (192 + x * 2304 / PV_W) & ~1u;
-            unsigned l = (pv_get10(p0, c) + pv_get10(p0, c + 1) + pv_get10(p1, c) + pv_get10(p1, c + 1)) >> 2;
-            unsigned g = pv_lut[l];
-            o[x] = 0xff000000u | (g << 16) | (g << 8) | g;
+            unsigned c = (c0 + x * cw / PV_W) & ~1u;
+            unsigned s0 = pv_get10(p0, c), s1 = pv_get10(p0, c + 1);
+            unsigned s2 = pv_get10(p1, c), s3 = pv_get10(p1, c + 1);
+            unsigned mx = s0; if (s1 > mx) mx = s1; if (s2 > mx) mx = s2; if (s3 > mx) mx = s3;
+            unsigned l = (s0 + s1 + s2 + s3) >> 2;
+            if (mx >= 1020) clip++;
+            if (pv_zebra && mx >= 1020 && (((x + y + pv_stat[0]) & 7) < 4)) {
+                o[x] = 0xffff2800u;
+            } else {
+                unsigned g = pv_lut[l];
+                o[x] = 0xff000000u | (g << 16) | (g << 8) | g;
+            }
             if (!(x & 3)) { sum += l; n++; }
         }
     }
-    for (x = 0; x < PV_W + 2; x++) { PV_RGBA[(PV_Y - 1) * PV_BW + PV_X - 1 + x] = 0xffffffffu; PV_RGBA[(PV_Y + PV_H) * PV_BW + PV_X - 1 + x] = 0xffffffffu; }   // white frame
-    for (y = 0; y < PV_H; y++) { PV_RGBA[(PV_Y + y) * PV_BW + PV_X - 1] = 0xffffffffu; PV_RGBA[(PV_Y + y) * PV_BW + PV_X + PV_W] = 0xffffffffu; }
+    pv_clip_pct = clip ? ((clip * 100 + PV_W * PV_H - 1) / (PV_W * PV_H)) : 0;
+    border = pv_clip_pct ? 0xffff9000u : 0xffffffffu;
+    for (x = 0; x < PV_W + 2; x++) { PV_RGBA[(PV_Y - 1) * PV_BW + PV_X - 1 + x] = border; PV_RGBA[(PV_Y + PV_H) * PV_BW + PV_X - 1 + x] = border; }
+    for (y = 0; y < PV_H; y++) { PV_RGBA[(PV_Y + y) * PV_BW + PV_X - 1] = border; PV_RGBA[(PV_Y + y) * PV_BW + PV_X + PV_W] = border; }
     pv_stat[0]++; pv_stat[1] = black; pv_stat[2] = n ? sum / n : 0;
     pv_make_lut(black, pv_stat[2]);
     vid_bitmap_refresh();
 }
+static void sh_pv_hud(void) { sh_hud(1); }   // v174: minimal HUD (status bar + exposure bar)
 static void sh_preview(char *buf, unsigned phys, unsigned lines)
 {
     unsigned fails = 0, dt, endp;
-    sh_pv_key = 0; sh_pv_n = 0; pv_stat[0] = 0;
+    sh_pv_key = 0; sh_pv_n = 0; pv_stat[0] = 0; pv_clip_pct = 0;
+    pv_geom(); sh_hud_clear();
     pv_make_lut(64, 300);
     slog("v165 preview start lines=%d", lines, 0);
     for (;;) {
         int r;
         if (sh_stop_req) { sh_pv_key = 1; break; }                          // REC (keywatch)
-        if (kbd_is_key_pressed(KEY_SET)) { sh_pv_key = 2; break; }
-        if (kbd_is_key_pressed(KEY_MENU)) { sh_pv_key = 3; break; }
+        if (sh_quit_req || (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET))) { sh_pv_key = 3; break; }   // v176: MENU held / MENU+SET = quit
         if (sh_usb()) { sh_pv_key = 4; break; }
         if (shamem(0xc0f06804) != 0x045702a6 || *(volatile unsigned *)DSS_FLAGS == 0) { sh_pv_key = 5; break; }
+        { int nv = sh_handle_nav(1); if (nv == 2) { pv_clear(); pv_geom(); } if (nv) sh_pv_hud(); }
         dt = endp = 0;
         r = lvn_cap(buf, phys, lines, &dt, &endp);
         if (px_on) px_close();
@@ -3437,6 +3679,7 @@ static void sh_preview(char *buf, unsigned phys, unsigned lines)
             fails = 0;
             pv_render(buf);
             sh_pv_n++;
+            if ((sh_pv_n & 3) == 1) sh_pv_hud();
         }
         if (fails >= 20) { sh_pv_key = 6; break; }
         wb_mon(0); sh_gui_assert();
@@ -3454,8 +3697,9 @@ static void lv_x3(void)
     unsigned phys, k, i, npass = 1, lines = 256, bpp = 14, wms = 0, gap = 500, fl = 0, nfit, kk;
     int fd, ok = 1;
 
+    if (ts_pinned) { strcpy(msg, "EXMEM pinned: redemarrer"); return; }
     msg[0] = 0; x_chf = 0; x_xo = 0; x_lo = 2000; x_hi = 7000;
-    px_cycle = 6; x_need = 0; x_start_us = 0; ch_idx = 12; x_he_mode = 0; x_dc = 99; x_skipy = 0; x_skipn = 0; x_skips = 0; x_skip_fr = 0; x_enc = 0; x_csh = 4; x_unpk = 0; x_unpk_set = 0; x_j9c = 0; x_jpn = 0; enc_wr2 = 9; enc_rd = 0x23; lj_eh = 0; enc_w2w = enc_w2h = 0; x_epn = 0; lj_ns = 1; lj_gap = 0; lj_new_win = 0; lj_last_win = 0; lj_swlo = lj_swhi = 0; lj_swch = 0x40000; enc_mode = 1; x_rowm = 1; enc_prm_a = enc_prm_b = 0; enc_wov = 0; enc_rdb = 0; enc_wstride = 0; lj_wlo = lj_whi = 0; x_hbn = 6; lj_swe = 0; lj_eoff = 0; lj_kwait = 8000; lj_chase = 0; lj_chased = 0; lj_chase_n = 0; lj_chase_miss = 0; lj_u371 = 0; lj_ebits = 0; lj_rdf = 0; x_her = 0; x_exsz = EXMEM_SIZE; x_pbl = 0; x_skick = 0; ts_period = 0;           // v73 defaults (6 frames = 240 ms max hold of sem #6)
+    px_cycle = 6; x_need = 0; x_start_us = 0; ch_idx = 12; x_he_mode = 0; x_dc = 99; x_skipy = 0; x_skipn = 0; x_skips = 0; x_skip_fr = 0; x_enc = 0; x_csh = 4; x_unpk = 0; x_unpk_set = 0; x_j9c = 0; x_jpn = 0; enc_wr2 = 9; enc_rd = 0x23; lj_eh = 0; enc_w2w = enc_w2h = 0; x_epn = 0; lj_ns = 1; lj_gap = 0; lj_new_win = 0; lj_last_win = 0; lj_swlo = lj_swhi = 0; lj_swch = 0x40000; enc_mode = 1; x_rowm = 1; enc_prm_a = enc_prm_b = 0; enc_wov = 0; enc_rdb = 0; enc_wstride = 0; lj_wlo = lj_whi = 0; x_hbn = 6; lj_swe = 0; lj_eoff = 0; lj_kwait = 8000; lj_chase = 0; lj_chased = 0; lj_chase_n = 0; lj_chase_miss = 0; lj_u371 = 0; lj_ebits = 0; lj_rdf = 0; x_her = 0; x_exsz = EXMEM_SIZE; x_pbl = 0; x_skick = 0; ts_period = 0; x_rsel = 0; x_he_fix = 0; x_he_fixed = 0; x_dup_us_max = 0;           // v73 defaults (6 frames = 240 ms max hold of sem #6)
     fd = sh_on ? -1 : open("A/M10X3.CFG", O_RDONLY, 0777);
     if (sh_on || fd >= 0) {
         int n;
@@ -3533,7 +3777,21 @@ static void lv_x3(void)
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v <= 1184) x_pbl = v; }   // v150: 55th = busy-poll lines
             if (*q && *q != '\n') x_skick = strtol(q, &q, 10);   // v151: 56th = kick on short frames
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 1000 && v <= 10000) ts_period = v; }   // v153: 57th = task sampler us (0 off)
+            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 16); if (v == 0x10 || v == 0x12 || v == 0x22 || v == 0x2e) x_rsel = v; }   // v169: 58th = raw selector (hex)
+            if (*q && *q != '\n') x_he_fix = strtol(q, &q, 10);   // v172: 59th = replace HEAD_ERR frames by previous healthy frame
         }
+    }
+    if (sh_on) {
+        const sh_prof_t *pr = sh_prof();
+        if (!sh_pv) { bpp = pr->bpp; x_rsel = pr->rsel; x_he_fix = 1; }   // v172: preview stays 10-bit; REC uses profile depth/selector + HE replacement
+        else { bpp = 10; x_rsel = 0; x_he_fix = 0; }   // v174: recipe is now the 14-bit REC line; preview keeps its v165 10-bit path
+        enc_wov = pr->w;
+        lj_eoff = pr->c0 * bpp / 8;
+    }
+    if (x_he_fix && (!(fl & 0x100) || !(fl & 0x1000000) || !(x_xo & 0x80000000) || !x_her ||
+                     x_enc != 11 || lj_ns != 1 || lj_new_win != 2 || lj_chase)) {
+        strcpy(msg, "HEFIX: kick/HER sans chase requis");
+        return;   // v172b: replacement only in the qualified single-stream kick path
     }
     {   // v81: write channel geometry (ROM table 0xfc6d87b8 / resources 0xfc6dd8e4)
         static const unsigned cb[25] = { 0xc0f04000, 0xc0f04100, 0xc0f04200, 0xc0f04300, 0xc0f04400, 0xc0f04500, 0xc0f04600,
@@ -3555,13 +3813,19 @@ static void lv_x3(void)
     { unsigned hh = (shamem(0xc0f06804) >> 16) & 0xffff;   // v89s: any tall head (live103: 1254...) -> CH12 frame = H - 6
       if ((fl & 0x20000000) && hh >= 0x4a6 && hh <= 1280 + 6 && lines > ((x_xo & 0x1000) ? hh : hh - 6)) lines = (x_xo & 0x1000) ? hh : hh - 6; }   // v75d: xo 0x1000 = ask more, end by the 8830 abort
     if (bpp != 10 && bpp != 12) bpp = 14;
-    x_zoom = (shamem(0xc0f06804) == 0x045702a6) ? 1 : 0;   // v156: x5 magnifier, 2592 x 1108, 33.3 ms frames
+    x_zoom = zoom_head(shamem(0xc0f06804)) ? 1 : 0;   // v156: x5 magnifier, 2592 x 1108, 33.3 ms frames (v168z: tall heads too)
     x_w = x_zoom ? 2592 : LVN_W; x_per = x_zoom ? 33307 : 40000;
     if (x_zoom) { unsigned m = *(volatile unsigned *)0x865c, pc = (m < 0x34) ? *(volatile unsigned *)(0x575b0 + 36 * m + 0x1c) : 0; if (pc >= 20000 && pc <= 60000) x_per = pc; }   // v158: m10zfps.py sets 40017
-    if (x_zoom && lines > 1104) lines = 1104;              // native 1108 minus the head tail
+    if (x_zoom) { unsigned zl = (shamem(0xc0f06804) >> 16) - 7; if (lines > zl) lines = zl; }   // native 1111-line head -> 1104 (v168z: H - 7)
     if (enc_wov > x_w) enc_wov = 0;                        // v159
     lvn_bpp = bpp; lvn_lb = x_w * bpp / 8;
-    if (lines * lvn_lb > 0x00400000) lines = 0x00400000 / lvn_lb;   // one EDMAC block < 4 MiB
+    {   // v170: allow 2-block CH12 (> 4 MiB) when cropping 14-bit into a < 4 MiB encoder window
+        unsigned enc_fb_est = (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * bpp / 8;
+        if (lines * lvn_lb > 0x00400000) {
+            if (!(x_zoom && bpp == 14 && (x_enc == 11 || x_enc == 14) && enc_wov && enc_fb_est <= 0x00400000 && (lines - lines / 2) * lvn_lb <= 0x00400000))
+                lines = 0x00400000 / lvn_lb;   // one EDMAC block < 4 MiB
+        }
+    }
     memset(&lm2, 0, sizeof(lm2));
     memcpy(lm2.magic, "M10LVX03", 8);
     lm2.w = x_w; lm2.lines = lines; lm2.lb = lvn_lb; lm2.npass = npass;
@@ -3627,6 +3891,7 @@ static void lv_x3(void)
     slog("  tg=%d is=%08x", *(volatile unsigned *)0x0000e664, (*(volatile unsigned *)0x00008654 << 16) | (*(volatile unsigned *)0x00008658 & 0xffff));
     /* v153: same extra reserve for REC off/on, no change to raw/compressed ring
      * addresses or existing SIO scratch. Never allocate the trace in CHDK heap. */
+    if (x_rsel) slog("v169 rsel=%x canon 37040=%08x", x_rsel, shamem(0xc0f37040));
     if (ts_period && (!(fl & 0x100) || !ts_kernel_ok())) { strcpy(msg, "TSK kernel/config refuse"); slog("v153 task preflight refused", 0, 0); return; }
     buf = exmem_alloc_uncached(EXMEM_TYPE, x_exsz + ((fl & 0x100) ? TS_EXTRA + CAP_BYTES : 0), &ai);
     if (!buf) { strcpy(msg, "EXMEM refuse"); return; }
@@ -3702,16 +3967,22 @@ static void lv_x3(void)
         xr_nullsz = ((xr_fb + 16 + 511) & ~511u) - xr_fb;
         xr_stride = 512 + xr_fb + xr_nullsz;
         xr_nslot = (x_exsz - 0x00080000) / (xr_mlv ? xr_stride : xr_fb);
-        lj_on = (x_enc == 11 && xr_mlv && lvn_bpp == 10) ? 1 : 0;   // v101: compressed REC
-        if (lj_on) {    // 16 MiB: raw ring 3 x 2.68 MB, compressed ring (2.6 MB slots) after it, last 512 KiB = SIO copy
+        lj_on = (x_enc == 11 && xr_mlv && (lvn_bpp == 10 || (lvn_bpp == 14 && (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * 14 / 8 <= 0x00400000))) ? 1 : 0;   // v101/v170: compressed REC (10b or <4 MiB cropped 14b)
+        if (lj_on) {    // raw ring 3 x xr_fb, compressed ring after it, last 512 KiB = SIO copy
+            unsigned enc_fb = (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * lvn_bpp / 8;
             lj_raw_n = 3; lj_cbase = (lj_raw_n * xr_fb + 0xfff) & ~0xfffu;
-            lj_cslot_sz = x_zoom ? ((xr_fb + xr_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000; lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
+            lj_cslot_sz = x_zoom ? ((enc_fb + enc_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000; lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
+            if (x_he_fix) {
+                if (lj_cslot_n > LJ_MAP_N) lj_cslot_n = LJ_MAP_N;
+                if (lj_cslot_n < 2) { exmem_free_uncached(EXMEM_TYPE); strcpy(msg, "HEFIX: slots insuffisants"); return; }
+                for (i = 0; i < LJ_MAP_N; i++) lj_map[i] = 0xffffffff;
+            }
             xr_nslot = lj_raw_n; lj_cnt = lj_err = lj_done = 0; lj_gate = (fl & 0x200) ? 1 : 0; if (lj_new_win == 2) lj_gate = 2;   // v119: 34th field 2 = slices after readout ends   // v103: flag 0x200 = gated encoder (writes stay ungated in LJ mode)
             lj_buf = (unsigned char *)buf; lj_phys = phys;
-            enc_w = enc_wov ? enc_wov : x_w; enc_h = lj_eh ? lj_eh : lines; enc_bits = lj_ebits ? lj_ebits : 2; enc_rd10 = 1; enc_unpk = 0; enc_prec = 0;   // v146 lj_ebits; v107, v133 (v136: fixed, the v133 edit had commented out the rest of the line)
+            enc_w = enc_wov ? enc_wov : x_w; enc_h = lj_eh ? lj_eh : lines; enc_bits = lj_ebits ? lj_ebits : 2; enc_rd10 = (lvn_bpp == 10) ? 1 : 0; enc_unpk = 0; enc_prec = 0;   // v170: enc_rd10=0 for 14-bit; v146 lj_ebits
             enc_wr2_off = x_exsz - 0x00080000 - 0x00040000; enc_no_snap = 1; sem_enc = 0;
             {
-                int hf = open("A/M10HUF.BIN", O_RDONLY, 0777);
+                int hf = open((lvn_bpp == 14) ? "A/M10HUF14.BIN" : "A/M10HUF.BIN", O_RDONLY, 0777);
                 enc_huff_ok = 0;
                 if (hf >= 0) { if (read(hf, enc_huff, 96) == 96) enc_huff_ok = 1; close(hf); }
             }
@@ -3722,7 +3993,8 @@ static void lv_x3(void)
         lm2.npass = npass;
         { char nm[24]; sprintf(nm, "%s.%s", xr_base, xr_mlv ? "MLV" : "RAW"); xr_fd = open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0777); }
         if (xr_fd < 0) { exmem_free_uncached(EXMEM_TYPE); strcpy(msg, "RAW open err"); return; }
-        xr_fileno = 0; xr_fbytes = 512;
+        xr_fileno = 0; xr_fbytes = 512; xr_chunk_start = 0;
+        mlv_guid_lo = get_tick_count();
         mlv_crop = lj_on && (enc_wov || lj_eh || lj_eoff);
         if (mlv_crop) slog("  v159 crop %dx%d", enc_w, enc_h), slog("  v159 eoff=%d", lj_eoff, 0);
         if (xr_mlv) { mlv_build_hdr(mlv_crop ? enc_w : x_w, mlv_crop ? enc_h : lines, lj_on ? 14 : lvn_bpp, 0); if (lj_on) put16(mlv_hdr + 32, 0x21); write(xr_fd, mlv_hdr, 512); }   // v101: MLV video class 0x21 = RAW | LJ92
@@ -3730,7 +4002,7 @@ static void lv_x3(void)
         xr_sem = CreateBinarySemaphore("M10XR", 0);
         memset(tlf, 0, sizeof(tlf));   // v140
         capl = (unsigned (*)[5])(buf + x_exsz + TS_EXTRA); memset(capl, 0, CAP_BYTES); cap_n = 0; cap_k = 0xffffffff;   // v154: inside the REC-only reserve allocated above
-        if (lj_on) { lj_sem = CreateBinarySemaphore("M10LJ", 0); lj_sem_p = &lj_sem; x_early = (lj_new_win == 2); x_ready = 0; x_dr[0] = x_dr[1] = x_dr[2] = 0; lj_kicked = 0; lj_k_ok = 0; lj_k_no[0] = lj_k_no[1] = lj_k_no[2] = lj_k_no[3] = 0; lj_k_max = 0; x_kick = (lj_new_win == 2 && lj_ns == 1) ? lj_kick : 0; CreateTask("M10LJ", 0x1B, 0x1000, lj_task); }   // v124: back to 0x1B (0x19 starved the capture)   // v121   // v101: between capture (0x1A) and writer (0x1C)
+        if (lj_on) { lj_sem = CreateBinarySemaphore("M10LJ", 0); lj_sem_p = &lj_sem; x_early = (lj_new_win == 2); x_ready = 0; x_dr[0] = x_dr[1] = x_dr[2] = 0; lj_kicked = 0; lj_k_ok = 0; lj_k_no[0] = lj_k_no[1] = lj_k_no[2] = lj_k_no[3] = 0; lj_k_max = 0; lj_prev_sz = 0; lj_prev_tot = 0; lj_dup_h = 0; lj_dup_t = 0; x_kick = (lj_new_win == 2 && lj_ns == 1) ? lj_kick : 0; CreateTask("M10LJ", 0x1B, 0x1000, lj_task); }   // v124: back to 0x1B (0x19 starved the capture)   // v121   // v101: between capture (0x1A) and writer (0x1C)
         xr_gated = ((fl & 0x200) && !lj_on) ? 1 : 0;           // v39 (v103: LJ uses 0x200 for the encoder)
         xr_wlen = (wms && wms * 1024 < xr_fb) ? wms * 1024 : xr_fb;   // v41: 4th field = KiB written per frame
         xr_chunk = (fl & 0x800) ? 0x200000 : 0x20000;                // v41: bit11 big chunks
@@ -3780,8 +4052,12 @@ static void lv_x3(void)
             if (lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; x_early_fr = fr; }   // v121
             lj_chased = 0;   // v144
             r = lvn_cap(buf + off, phys + off, lines, &dt, &endp);
+            // v172b: an early kick proves this raw frame completed even if
+            // the later restore/wait failed. Classify its HE before advancing fr.
+            if (lj_on && x_he_fix && *(volatile unsigned *)(0x0000fa68 + 0x1c) &&
+                !(r > 0 && r != 2) && (lj_kicked == fr + 1 || lj_cnt > fr)) r = 1;
             if (lj_on && x_ready > fr && !(r > 0 && r != 2)) { if (lj_kicked == fr + 1 || lj_cnt > fr) { fr++; xr_prod = fr; } else x_ready = fr; }   // v121/v128: published early but the pass failed: if its encode already started, keep the frame (it is complete in DRAM), else take it back
-            if ((x_xo & 0x80000000) && x_her && *(volatile unsigned *)(0x0000fa68 + 0x1c) && r > 0 && r != 2) {   // v148: no-pause recovery: the frame is complete (one-line seam + 12 px shift), keep it
+            if ((x_xo & 0x80000000) && x_her && *(volatile unsigned *)(0x0000fa68 + 0x1c) && r > 0 && r != 2) {   // v148: no-pause recovery (v172: x_he_fix replaces torn frame)
                 unsigned hst = *(volatile unsigned *)(0x0000fa68 + 0x1c) & 0xff;
                 if (x_he_n < HE_ALL_N) x_he_all[x_he_n] = (fr << 8) | hst;
                 if (x_he_n < 32) x_he_at[x_he_n] = (fr << 8) | hst;
@@ -3790,7 +4066,25 @@ static void lv_x3(void)
                 *(volatile unsigned *)(0x0000fa68 + 0x1c) = 0;   // acknowledge, re-arm the cause masks (same as v89c)
                 eng_out(0xc0f072c8, 0x20); eng_out(0xc0f072cc, 0x20); eng_out(0xc0f072d0, 0x40); eng_out(0xc0f072d4, 0x40);
                 if (x_he_n <= 8) slog("v148 he kept fr=%d n=%d", fr, x_he_n);
-                if (x_he_n >= x_hbn && fr - (x_he_at[(x_he_n < 32 ? x_he_n : 32) - x_hbn] >> 8) < 64) { slog("v148 he burst, stop REC fr=%d", fr, 0); ok = -6; break; }
+                if (lj_on && x_he_fix && x_kick) {
+                    if (lj_cnt > fr || (fr == 0 && lj_kicked)) {
+                        // Already published, or first frame already in JpCore:
+                        // no safe predecessor. Stop explicitly, never copy over DMA.
+                        lj_err = 6; ok = -7; break;
+                    }
+                    if (fr == 0) { drops++; continue; }
+                    if (lj_dup_h - lj_dup_t >= LJ_DUP_N) { lj_err = 6; ok = -7; break; }
+                    lj_dup_q[lj_dup_h % LJ_DUP_N] = fr;
+                    lj_dup_h++;
+                    x_ready = fr + 1;
+                    x_he_fixed++;
+                    GiveSemaphore(lj_sem);
+                }
+                if (x_he_n >= x_hbn && fr - (x_he_at[(x_he_n < 32 ? x_he_n : 32) - x_hbn] >> 8) < 64) {
+                    slog("v148 he burst, stop REC fr=%d", fr, 0);
+                    if (lj_on && x_he_fix && x_kick) { fr++; xr_prod = fr; }
+                    ok = -6; break;
+                }
                 // fall through: normal frame path below (fr++, encoder / writer)
             } else
             if ((x_xo & 0x80000000) && *(volatile unsigned *)(0x0000fa68 + 0x1c)) {   // v87: trapped head error in REC: drop, recover, re-arm
@@ -3800,7 +4094,7 @@ static void lv_x3(void)
                 if (x_he_n >= 32) { unsigned q; for (q = 0; q < 31; q++) x_he_at[q] = x_he_at[q + 1]; x_he_at[31] = (fr << 8) | 0x40; }   // v143: keep the last 32 for the burst check on long takes
                 x_he_n++; drops++;
                 if (px_on) px_close();
-                if (x_he_n == 1) hs_take(1);   // v88 (v89b: no EDMAC sampling here, r100i)
+                if (x_diag && x_he_n == 1) hs_take(1);   // v88 (v167: diag only)
                 if (x_he_n <= 8) slog("v89e REC he fr=%d n=%d", fr, x_he_n);   // v89e: survives a shutdown
                 if (x_he_n == 1) { wr_force = 1; wr_init(); }   // v89o: ImgSens/TG words from the 1st error on (TG freeze study)
                 if (x_he_n >= x_hbn && fr - (x_he_at[(x_he_n < 32 ? x_he_n : 32) - x_hbn] >> 8) < 64) {   // v143: burst threshold x_hbn (48th field, default 6)   // v89h: 3 errors in < 64 frames -> stop before WBInteg 3491 (r100p/q); v89l: 6 (WB kick v89j/k feeds WBInteg)
@@ -3829,9 +4123,12 @@ static void lv_x3(void)
                 }
                 continue;
             }
-            if ((x_xo & 0x80000000) && r > 0 && r != 2) {   // v88: slot 0 = good frames before the 1st error (every 8th), slot 2 = 2nd good frame after
-                if (!x_he_n) { if (!(fr & 7)) hs_take(0); if (fr == 4) ea_take(0); x_r450a0 = shamem(0xc0f450a0); }   // v89: EDMAC map once, frame 4; v89f: 450a0
-                else if (hs_n == 2 && ++hs_after == 2) { hs_take(2); ea_take(2); }   // v89d: any count (r100k: 2 errors on one frame)
+            if ((x_xo & 0x80000000) && r > 0 && r != 2) {   // v88: diag snapshots + pre-error 450a0 tracking
+                if (!x_he_n) {
+                    if (x_diag) { if (!(fr & 7)) hs_take(0); if (fr == 4) ea_take(0); }   // v167: no 120 ms stall in REC unless x_diag set
+                    x_r450a0 = shamem(0xc0f450a0);
+                }
+                else if (x_diag && hs_n == 2 && ++hs_after == 2) { hs_take(2); ea_take(2); }
             }
             if (r == 2) { drops++; x_dr[2]++; continue; }      // v58: PACK32 busy, frame skipped
             if (r <= 0 && x_her && x_he_n && fr - (x_he_at[(x_he_n < 32 ? x_he_n : 32) - 1] >> 8) <= 2 && x_he_late < 16) {   // v148: a pass failed right after a kept error (chain hiccup): old wait for 2 clean sensor frames instead of stopping
@@ -3860,7 +4157,7 @@ static void lv_x3(void)
                 if (fd >= 0) { write(fd, hd, sizeof(hd)); write(fd, tl, sizeof(tl)); if (sb) write(fd, rb, hd[4] * 64); write(fd, stg, sizeof(stg)); write(fd, x_pm, sizeof(x_pm)); write(fd, x_df, sizeof(x_df)); write(fd, x_pr, sizeof(x_pr)); write(fd, &wr_n, 4); write(fd, wr_log, sizeof(wr_log)); close(fd); }
                 ok = r; break;
             }
-            if (fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; }
+            if (!lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; }   // v167: in lj_on mode L3780 pre-capture timestamp stands
             if (xr_mlv && !lj_on) mlv_frame_hdr((unsigned char *)buf + slot * xr_stride, fr, xr_fb, (get_tick_count() - t0) * 1000);
             if (fr < 16) lm2.dt[fr] = dt;
             fr++;
@@ -3873,15 +4170,23 @@ static void lv_x3(void)
         slog_flush();   // v155: capture over, PACK32 released: write the deferred lines
         cap_n = k < CAP_N ? k : CAP_N; cap_k = 0xffffffff;   // v154
         if (!ts_stop()) { ok = -8; slog("v153 task drain timeout; EXMEM/module pinned", 0, 0); }
+        if (lj_on && x_kick && !lj_err && !xr_err) lj_drain();   // v167: encode & enqueue any remaining tail frames before xr_stop
         xr_stop = 1; GiveSemaphore(xr_sem);
-        if (lj_on && x_kick) { unsigned t = get_tick_count(); while (lj_kicked && !cb_done && get_tick_count() - t < 3000) msleep(5); lj_collect(); }   // v127: last kicked frame
+        if (lj_on && x_kick) { unsigned t = get_tick_count(); while (lj_kicked && !cb_done && get_tick_count() - t < 3000) msleep(5); lj_collect(); }   // v127: fallback if lj_drain skipped on err
         if (lj_on) { GiveSemaphore(lj_sem); { unsigned t = get_tick_count(); while (!lj_done && get_tick_count() - t < 20000) { GiveSemaphore(lj_sem); msleep(20); } } }
         { unsigned t = get_tick_count(); while (!xr_done && get_tick_count() - t < 20000) { GiveSemaphore(xr_sem); msleep(20); } }
+        if (!xr_done || (lj_on && (!lj_done || lj_kicked))) {
+            // A timed-out task/encoder may still touch EXMEM. Keep all state,
+            // semaphores and module resident; only a power cycle can recover.
+            ts_pinned = 1;
+            slog("v172b drain timeout: EXMEM/module pinned", 0, 0);
+            strcpy(msg, "Drain bloque: redemarrer boitier");
+            return;
+        }
         lm2.ndone = xr_wr;
         if (xr_mlv && fr > 1 && fr <= XR_MAX && xr_tick[fr - 1] > xr_tick[0])   // v89r: real cadence (frame timestamps), e.g. 12.4 fps
             mlv_fps1000 = (fr - 1) * 1000000u / (xr_tick[fr - 1] - xr_tick[0]);
-        if (xr_mlv && xr_fileno == 0) { mlv_build_hdr(mlv_crop ? enc_w : x_w, mlv_crop ? enc_h : lines, lj_on ? 14 : lvn_bpp, xr_wr); if (lj_on) put16(mlv_hdr + 32, 0x21); lseek(xr_fd, 0, SEEK_SET); write(xr_fd, mlv_hdr, 512); close(xr_fd); }
-        else if (xr_mlv) close(xr_fd);          // v57: frame counts / fileCount fixed by m10mlv.py --fix
+        if (xr_mlv) mlv_finalize(mlv_crop ? enc_w : x_w, mlv_crop ? enc_h : lines, lj_on ? 14 : lvn_bpp, lj_on);
         else { lseek(xr_fd, 0, SEEK_SET); write(xr_fd, &lm2, sizeof(lm2)); close(xr_fd); }
         fd = open("A/M10X3T.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);
         if (fd >= 0) { write(fd, &fr, 4); write(fd, xr_tick, fr * 4); write(fd, xr_wus, fr * 4); close(fd); }
@@ -3923,6 +4228,8 @@ static void lv_x3(void)
         slog("  v89q tg fixes=%d", tg_fix_n, 0);
         slog("  v87 he_n=%d", x_he_n, 0);
         slog("  v148 her=%d late=%d", x_her, x_he_late);
+        slog("  v172 he fix=%d fixed=%d", x_he_fix, x_he_fixed);
+        if (x_he_fixed) slog("  v172 dup us max=%d", x_dup_us_max, 0);
         slog("  v151 skick=%d n=%d", x_skick, x_skick_n);
         slog("  v91 skipn=%d skips=%d", x_skipn, x_skips);
         for (i = 0; i < x_he_n && i < 32; i++) slog("   he at frame %d st=%x", x_he_at[i] >> 8, x_he_at[i] & 0xff);
@@ -4085,9 +4392,9 @@ static void lv_x3(void)
         fd = open("A/LVX3S.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);
         if (fd >= 0) { write(fd, hd, sizeof(hd)); write(fd, tl, sizeof(tl)); if (sb) write(fd, rb, hd[4] * 64); write(fd, stg, sizeof(stg)); write(fd, x_pm, sizeof(x_pm)); write(fd, x_df, sizeof(x_df)); write(fd, x_pr, sizeof(x_pr)); write(fd, &wr_n, 4); write(fd, wr_log, sizeof(wr_log)); close(fd); }
     }
-    if (x_enc && ok > 0 && lm2.ndone >= 1 && (x_enc == lvn_bpp || (x_enc == 11 && lvn_bpp == 10)) && lines * lvn_lb <= 0x00400000 && !(x_zoom && x_enc == 10)) {   // v92: lossless encoder on pass 0 (v157: no CPU conversion in zoom)
+    if (x_enc && ok > 0 && lm2.ndone >= 1 && (x_enc == lvn_bpp || (x_enc == 11 && lvn_bpp == 10)) && ((enc_wov ? enc_wov : x_w) * lines * lvn_bpp / 8 <= 0x00400000) && !(x_zoom && x_enc == 10)) {   // v92/v170: lossless encoder on pass 0 (supports cropped 14-bit)
         unsigned eus = 0, sz, hdr[8];
-        enc_w = enc_wov ? enc_wov : x_w; enc_h = lines; enc_in_off = 0; enc_bits = lj_ebits ? lj_ebits : ((x_enc == 12) ? 1 : 2);   // v146, v133
+        enc_w = enc_wov ? enc_wov : x_w; enc_h = lines; enc_in_off = lj_eoff; enc_bits = lj_ebits ? lj_ebits : ((x_enc == 12) ? 1 : 2);   // v146, v133, v170 lj_eoff
         enc_rd10 = (x_enc == 11); enc_unpk = x_unpk_set ? x_unpk : (x_csh & 3) << 4;   // v95: CSH = unpacker code (0 = 10-bit); v97: 22nd field = raw value
         enc_prec = x_csh >> 4; enc_9c = x_j9c;   // v96: CSH = prec * 16 + unpack code, e.g. 160 = P 10
         if (x_enc == 10) {                          // v93: CPU 10 -> 14 bits into buf + 3 MiB (read uncached, then cached alias)
@@ -4161,7 +4468,7 @@ static void cine_task(void)
     if (fx >= 0) close(fx);
     int fz = open("A/M10Z.CFG", O_RDONLY, 0777);   // v156: marker file -> lv_x3 also in the x5 magnifier
     if (fz >= 0) close(fz);
-    if (h == 0x045702a6 && fz >= 0 && fx >= 0 && *(volatile unsigned *)DSS_FLAGS != 0) lv_x3();
+    if (zoom_head(h) && fz >= 0 && fx >= 0 && *(volatile unsigned *)DSS_FLAGS != 0) lv_x3();   // v168z: tall zoom too
     else if (h != 0 && *(volatile unsigned *)DSS_FLAGS != 0 && h != 0x045702a6 && ((h >> 16) == 0x4a6 || fx >= 0))
         lv_x3();                    // v25: Film / 1x3 (head 1190 lines), v27: any head if A/M10X3.CFG
     else if (h != 0 && *(volatile unsigned *)DSS_FLAGS != 0 && h != 0x045702a6)
@@ -4198,51 +4505,187 @@ static unsigned sh_take = 0, sh_key = KEY_VIDEO, sh_frames = 0;
 static char sh_line[64], sh_l1[48], sh_l2[64];
 static volatile unsigned sh_dirty = 1, sh_quit = 0, sh_rec_on = 0;
 static unsigned sh_t_redraw = 0;
-static void sh_say(const char *s1, const char *s2)   // text only; drawn by the GUI task (sh_redraw)
+static void sh_say(const char *s1, const char *s2)   // v174: transient message (centre toast), drawn by sh_hud
 {
     strncpy(sh_l1, s1, sizeof(sh_l1) - 1); sh_l1[sizeof(sh_l1) - 1] = 0;
     strncpy(sh_l2, s2 ? s2 : "", sizeof(sh_l2) - 1); sh_l2[sizeof(sh_l2) - 1] = 0;
     sh_dirty = 1;
 }
+// ---------------------------------------------------------------------------
+// v174: manual exposure in the shell. Canon's own Tv/ISO controls are hidden (our gui
+// handler eats the keys) and, in the x5 magnifier, Canon's dial events drop the magnifier
+// (live r133). So exposure is forced at the sensor through the SIO hook override tables,
+// exactly as m10sio.py does (validated in x5 at 20:15: CMOS 0 = analog gain, TG 805f/8061
+// = end-of-exposure line, Gray coded; magnifier kept, image follows linearly).
+//   ISO : CMOS reg 0  100 0x03, 200 0x27, 400 0x4b, 800 0x6f, 1600 0x93, 3200 0xb7 (live109)
+//   Tv  : exposure = (frame lines - end line) * line time. 24p loupe: frame 1819 lines,
+//         41666 us -> 22.9 us/line. AUTO = Canon AE (no override).
+// Hook v6 layout: header at +0x200 (+20 = cmos enable), cmos table +0x240 (16 x (0x10000|v)),
+// TG table +0x300 (64 x (reg<<16|val)), match +0x400, header +28 = TG enable, +40/+44 counters.
+// ---------------------------------------------------------------------------
+static const unsigned short sh_iso_v[] = { 0, 100, 200, 400, 800, 1600, 3200 };
+static const unsigned char  sh_iso_c[] = { 0, 0x03, 0x27, 0x4b, 0x6f, 0x93, 0xb7 };
+#define SH_NISO (sizeof(sh_iso_v) / sizeof(sh_iso_v[0]))
+static const unsigned short sh_tv_d[] = { 0, 30, 48, 50, 60, 100, 125, 200, 250, 500, 1000 };   // 1/x s; 0 = AUTO
+#define SH_NTV (sizeof(sh_tv_d) / sizeof(sh_tv_d[0]))
+static volatile unsigned sh_iso_i = 0, sh_tv_i = 0;          // 0 = AUTO (Canon)
+static volatile int sh_av96 = 0;                              // v176: 0 = AUTO (Canon), else av96 (F = 2^(av96/192))
+extern short shooting_get_min_av96(void);
+extern short shooting_get_max_av96(void);
+extern void shooting_set_av96_direct(short av96, short is_now);
+extern int shooting_get_aperture_from_av96(short av96);
+extern void exit_alt(void);
+#define FN_MOVEIRIS 0xfc43f6b9                               // MoveIrisWithAv(short *) 110d
+static void sh_av_apply(void)
+{
+    short v;
+    if (!sh_av96) return;
+    v = (short)sh_av96;
+    shooting_set_av96_direct(v, 1);
+    ((fn1)FN_MOVEIRIS)((unsigned)&v);
+    slog("v176 av96=%d", sh_av96, 0);
+}
+static void sh_fmt_av(char *s)
+{
+    if (!sh_av96) { strcpy(s, "F AUTO"); return; }
+    { int a = shooting_get_aperture_from_av96((short)sh_av96); a = (a + 50) / 100; sprintf(s, "F%d.%d", a / 10, a % 10); }
+}
+static void sh_poke(unsigned a, unsigned v);
+extern unsigned long get_batt_perc(void);
+static unsigned sh_gray(unsigned b) { return b ^ (b >> 1); }
+static void sh_hook_w(unsigned off, unsigned v) { if (sh_hook) sh_poke((unsigned)sh_hook + off, v); }
+static void sh_expo_apply(void)
+{
+    unsigned i;
+    if (!sh_hook || *(volatile unsigned *)((unsigned)sh_hook + 0x200) != 0x364f4953) return;   // v6 only
+    // ISO: CMOS reg 0
+    if (sh_iso_i) { sh_hook_w(0x240, 0x10000 | sh_iso_c[sh_iso_i]); sh_hook_w(0x200 + 20, 1); }
+    else { sh_hook_w(0x240, 0); sh_hook_w(0x200 + 20, 0); }
+    // Tv: TG 805f / 8061 end line
+    sh_hook_w(0x200 + 28, 0); sh_hook_w(0x200 + 44, 0);
+    for (i = 0; i < 4; i++) { sh_hook_w(0x400 + 4 * i, 0); sh_hook_w(0x300 + 4 * i, 0); }
+    if (sh_tv_i) {
+        const sh_prof_t *pr = sh_prof();
+        unsigned fl = pr->fl, us = 1000000u / sh_tv_d[sh_tv_i], lines = us * fl / pr->per, end;
+        if (lines > fl - 40) lines = fl - 40;          // keep a margin before the next readout
+        if (lines < 2) lines = 2;
+        end = fl - lines;
+        if (end < 17) end = 17;                        // 0x11 = longest pose Canon itself programs in the loupe
+        sh_hook_w(0x300, (0x805fu << 16) | sh_gray(end));
+        sh_hook_w(0x304, (0x8061u << 16) | sh_gray(end));
+        sh_hook_w(0x200 + 40, 0);
+        sh_hook_w(0x200 + 28, 1);
+    }
+}
+static void sh_expo_off(void)
+{
+    unsigned i;
+    if (!sh_hook) return;
+    sh_hook_w(0x200 + 20, 0); sh_hook_w(0x200 + 28, 0); sh_hook_w(0x200 + 44, 0);
+    for (i = 0; i < 16; i++) sh_hook_w(0x240 + 4 * i, 0);
+    for (i = 0; i < 4; i++) { sh_hook_w(0x300 + 4 * i, 0); sh_hook_w(0x400 + 4 * i, 0); }
+}
+// ---------------------------------------------------------------------------
+// v174 HUD. One status bar (top), one exposure bar (bottom), nothing else.
+//   top    : [o REC 00:12 288]   24p 2K 14b        12 min   [batt]
+//   bottom : ISO 800 | 1/50 | ZEB | VUE       (selected field highlighted)
+// Pad: UP/DOWN pick the field, LEFT/RIGHT change it. REC/SET = take. MENU+SET = quit.
+// Fields: 0 ISO, 1 Tv, 2 aperture, 3 profile, 4 zebras, 5 preview size.
+// ---------------------------------------------------------------------------
+#define SH_NFIELD 6
+static volatile unsigned sh_field = 0, sh_hud_drawn = 0;
+static unsigned sh_toast_t = 0, sh_rec_t0 = 0;
+#define SH_C_BAR   MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_WHITE)
+#define SH_C_SEL   MAKE_COLOR(COLOR_WHITE, COLOR_BLACK)
+#define SH_C_DIM   MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_LT)
+static void sh_hud_clear(void)
+{
+    unsigned y;
+    for (y = 0; y < 20; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
+    for (y = 240 - 20; y < 240; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
+    for (y = 100; y < 140; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
+    vid_bitmap_refresh();
+    sh_hud_drawn = 0;
+}
+static void sh_fmt_tv(char *s, unsigned i) { if (!i) strcpy(s, "AUTO"); else sprintf(s, "1/%u", sh_tv_d[i]); }
+static void sh_hud(int force)
+{
+    const sh_prof_t *pr = sh_prof();
+    char s[48], tv[12];
+    unsigned kb = GetFreeCardSpaceKb(), mbps, mins, x, pct;
+    if (!force && sh_hud_drawn && get_tick_count() - sh_t_redraw < 500) return;
+    sh_t_redraw = get_tick_count(); sh_hud_drawn = 1;
+    // top bar
+    draw_rectangle(0, 0, 359, 19, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+    if (sh_rec_on) {
+        unsigned sec = (get_tick_count() - sh_rec_t0) / 1000;
+        draw_rectangle(4, 5, 13, 14, MAKE_COLOR(COLOR_RED, COLOR_RED), RECT_BORDER0 | DRAW_FILLED);
+        sprintf(s, "%02u:%02u", sec / 60, sec % 60);
+        draw_string(18, 2, s, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_RED));
+    } else draw_string(4, 2, "M10", SH_C_DIM);
+    sprintf(s, "%s%s", pr->tag, pr->fps != sh_armed_fps ? "*" : "");
+    draw_string(180 - (int)strlen(s) * 4, 2, s, SH_C_BAR);
+    mbps = pr->bpp == 14 ? 56 : 45;                          // measured MB/s (LJ92, typical scene)
+    mins = (kb >> 10) / mbps / 60;
+    sprintf(s, "%umin", mins);
+    draw_string(300 - (int)strlen(s) * 8, 2, s, mins < 3 ? MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_RED) : SH_C_BAR);
+    pct = get_batt_perc();
+    draw_rectangle(310, 5, 349, 14, MAKE_COLOR(COLOR_TRANSPARENT, COLOR_WHITE), RECT_BORDER1);
+    draw_rectangle(350, 8, 352, 11, MAKE_COLOR(COLOR_WHITE, COLOR_WHITE), RECT_BORDER0 | DRAW_FILLED);
+    x = 311 + 37 * (pct > 100 ? 100 : pct) / 100;
+    if (x > 311) draw_rectangle(311, 6, x, 13, MAKE_COLOR(pct < 20 ? COLOR_RED : COLOR_WHITE, pct < 20 ? COLOR_RED : COLOR_WHITE), RECT_BORDER0 | DRAW_FILLED);
+    // bottom bar: hidden during a take (nothing to change)
+    draw_rectangle(0, 220, 359, 239, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+    if (!sh_rec_on) {
+        static const int fx[SH_NFIELD] = { 4, 80, 140, 200, 262, 312 };
+        unsigned f;
+        for (f = 0; f < SH_NFIELD; f++) {
+            switch (f) {
+            case 0: if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO"); break;
+            case 1: sh_fmt_tv(tv, sh_tv_i); strcpy(s, tv); break;
+            case 2: sh_fmt_av(s); break;
+            case 3: sprintf(s, "%u/%ub", pr->fps, pr->bpp); break;
+            case 4: strcpy(s, pv_zebra ? "ZEB" : "zeb"); break;
+            default: strcpy(s, pv_full ? "PLEIN" : "VIGN"); break;
+            }
+            draw_string(fx[f], 222, s, f == sh_field ? SH_C_SEL : SH_C_BAR);
+        }
+    } else {
+        sprintf(s, "%s  %s  %s", sh_iso_i ? "" : "", "", "");
+        if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO");
+        draw_string(4, 222, s, SH_C_DIM);
+        sh_fmt_tv(tv, sh_tv_i); draw_string(80, 222, tv, SH_C_DIM);
+        sh_fmt_av(tv); draw_string(140, 222, tv, SH_C_DIM);
+        draw_string(250, 222, "REC = stop", SH_C_DIM);
+    }
+    // zebra clip readout next to the thumbnail
+    if (sh_pv && pv_clip_pct) { sprintf(s, "%u%%", pv_clip_pct); draw_string(PV_X, PV_Y - 17 < 20 ? 22 : PV_Y - 17, s, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_YELLOW)); }
+    // toast (centre, 2 s)
+    if (sh_dirty) { sh_dirty = 0; sh_toast_t = get_tick_count(); }
+    if (sh_l1[0] && get_tick_count() - sh_toast_t < 2000) {
+        unsigned w = strlen(sh_l1) > strlen(sh_l2) ? strlen(sh_l1) : strlen(sh_l2);
+        int x0 = 180 - (int)w * 4 - 6;
+        draw_rectangle(x0, 102, 360 - x0, sh_l2[0] ? 138 : 120, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+        draw_string(180 - (int)strlen(sh_l1) * 4, 103, sh_l1, SH_C_BAR);
+        if (sh_l2[0]) draw_string(180 - (int)strlen(sh_l2) * 4, 121, sh_l2, SH_C_DIM);
+    } else if (sh_l1[0]) {
+        unsigned y;
+        sh_l1[0] = 0;
+        for (y = 100; y < 140; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);   // under the toast only
+        if (sh_pv) sh_t_redraw = 0;
+    }
+    vid_bitmap_refresh();
+}
 // v164: magnifier "radar". Canon's x5 LCD shows only the magnifier rect [0x57d38: cx cy x0 y0 x1 y1]
 // (readout coordinates, 1040 x 694) of the 2592 x 1108 readout; the take records columns
-// SH_RX0..SH_RX1, rows SH_RY0..SH_RY1 of the same readout. Draw both, to scale, in a corner box.
+// v174: kept only as a small frame-line warning when the x5 view leaves the recorded window.
 #define SH_MAGRECT  0x00057d38
-#define SH_AX0      72              // active area in readout coordinates (OB 72 columns, 28 rows)
-#define SH_AY0      28
-#define SH_AX1      2592
-#define SH_AY1      1108
-#define SH_RX0      192             // recorded window: EOFF 240 bytes = 192 px, EW 2304, EH 1076
-#define SH_RX1      (192 + 2304)
-#define SH_RY0      28
-#define SH_RY1      (28 + 1076)
-#define SH_RDIV     18              // 2520 / 18 = 140 px wide, 1080 / 18 = 60 px high
-#define SH_RBX      (360 - 140 - 8) // box origin (CHDK 360 x 240 coordinates), bottom right
-#define SH_RBY      (240 - 60 - 8)
-static int sh_rx(int x) { if (x < SH_AX0) x = SH_AX0; if (x > SH_AX1) x = SH_AX1; return SH_RBX + (x - SH_AX0) / SH_RDIV; }
-static int sh_ry(int y) { if (y < SH_AY0) y = SH_AY0; if (y > SH_AY1) y = SH_AY1; return SH_RBY + (y - SH_AY0) / SH_RDIV; }
 static int sh_zoom_now(void) { return shamem(0xc0f06804) == 0x045702a6; }
-static void sh_radar(void)
-{
-    volatile int *r = (volatile int *)SH_MAGRECT;
-    int x0 = r[2], y0 = r[3], x1 = r[4], y1 = r[5];
-    if (x1 <= x0 || y1 <= y0 || x0 < 0 || x1 > 4000 || y1 > 2000) return;   // not a magnifier rect
-    draw_rectangle(sh_rx(SH_AX0) - 1, sh_ry(SH_AY0) - 1, sh_rx(SH_AX1) + 1, sh_ry(SH_AY1) + 1, MAKE_COLOR(COLOR_BLACK, COLOR_WHITE), RECT_BORDER1 | DRAW_FILLED);
-    draw_rectangle(sh_rx(SH_RX0), sh_ry(SH_RY0), sh_rx(SH_RX1), sh_ry(SH_RY1), MAKE_COLOR(COLOR_BLACK, COLOR_RED), RECT_BORDER1);
-    draw_rectangle(sh_rx(x0), sh_ry(y0), sh_rx(x1), sh_ry(y1), MAKE_COLOR(COLOR_YELLOW, COLOR_YELLOW), RECT_BORDER1);
-    {   // centre of the recorded frame
-        int cx = sh_rx((SH_RX0 + SH_RX1) / 2), cy = sh_ry((SH_RY0 + SH_RY1) / 2);
-        draw_hline(cx - 3, cy, 7, COLOR_RED); draw_vline(cx, cy - 3, 7, COLOR_RED);
-    }
-    draw_string(SH_RBX, SH_RBY - 18, (x0 < SH_RX0 || x1 > SH_RX1) ? "VUE HORS CADRE" : "rouge=REC jaune=vue", MAKE_COLOR(COLOR_BLACK, (x0 < SH_RX0 || x1 > SH_RX1) ? COLOR_RED : COLOR_WHITE));
-}
-static void sh_redraw(int force)   // v160: drawn from the shell task, never during a take
+static void sh_redraw(int force)   // v174: CHDK gui task entry point: HUD only, never during a take
 {
     if (sh_rec_on && !force) return;
-    if (!force && !sh_dirty && get_tick_count() - sh_t_redraw < 1000) return;
-    sh_dirty = 0; sh_t_redraw = get_tick_count();
-    draw_string(10, 10, sh_l1, MAKE_COLOR(COLOR_BLACK, sh_rec_on ? COLOR_RED : COLOR_WHITE));
-    draw_string(10, 30, sh_l2, MAKE_COLOR(COLOR_BLACK, COLOR_WHITE));
+    if (sh_pv && !force) return;                     // preview loop draws the HUD itself
+    sh_hud(force);
 }
 static int sh_kbd(void) { return sh_on ? 1 : 0; }   // v161: 1 = masked keys (REC, SET, MENU, arrows, shutter) never reach Canon; touch is not masked
 static gui_handler sh_gui = { GUI_MODE_MODULE, sh_redraw, sh_kbd, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
@@ -4291,22 +4734,68 @@ static int sh_install_trap(void)
     *(volatile unsigned *)0xfa84 = 0;
     return 1;
 }
-static int sh_arm_25p(void)   // = m10zfps.py arm 1747 cache fld (live116)
+static int sh_arm_fps(const sh_prof_t *pr, int update_cache)   // = m10zfps.py arm <fl> cache fld (live116)
 {
-    unsigned cur = *(volatile unsigned *)(SH_TGTAB + 4 * 46), per = 40017;
-    if (cur != SH_REC46) return cur == (unsigned)sh_rec || (*(volatile unsigned short *)(cur + 0xc) == 1747 && *(volatile unsigned *)(cur + 0xc8) == per);   // ours, or the same copy from m10zfps.py
-    if (*(volatile unsigned short *)SH_REC46 != 732 || *(volatile unsigned short *)(SH_REC46 + 0xc) != 1456 || *(volatile unsigned *)(SH_REC46 + 0xc8) != 33306) return 0;
-    if (*(volatile unsigned *)SH_FLD46 != 33306 || *(volatile unsigned *)(SH_FLD46 + 0x14) != 31979) return 0;
-    if (!sh_rec) { unsigned b = (unsigned)malloc(0xd0 + 0x60 + 64); if (!b) return 0; sh_rec = (char *)((b + 31) & ~31u); }
-    memcpy(sh_rec, (void *)SH_REC46, 0xd0);
-    *(unsigned short *)(sh_rec + 0x0c) = 1747; *(unsigned short *)(sh_rec + 0x10) = 1747;
-    *(unsigned short *)(sh_rec + 0x80) = 1747 - 57; *(unsigned *)(sh_rec + 0xc8) = per;
-    memcpy(sh_rec + 0xd0, (void *)SH_FLD46, 0x60);
+    unsigned cur = *(volatile unsigned *)(SH_TGTAB + 4 * 46), per = pr->per;
+    if (cur != (unsigned)sh_rec) {
+        if (*(volatile unsigned short *)SH_REC46 != 732 || *(volatile unsigned short *)(SH_REC46 + 0xc) != 1456 || *(volatile unsigned *)(SH_REC46 + 0xc8) != 33306) return 0;
+        if (*(volatile unsigned *)SH_FLD46 != 33306 || *(volatile unsigned *)(SH_FLD46 + 0x14) != 31979) return 0;
+        if (!sh_rec) { unsigned b = (unsigned)malloc(0xd0 + 0x60 + 64); if (!b) return 0; sh_rec = (char *)((b + 31) & ~31u); }
+        memcpy(sh_rec, (void *)SH_REC46, 0xd0);
+        memcpy(sh_rec + 0xd0, (void *)SH_FLD46, 0x60);
+    }
+    *(unsigned short *)(sh_rec + 0x0c) = pr->fl; *(unsigned short *)(sh_rec + 0x10) = pr->fl;
+    *(unsigned short *)(sh_rec + 0x80) = pr->fl - 57; *(unsigned *)(sh_rec + 0xc8) = per;
     *(unsigned *)(sh_rec + 0xd0) = per; *(unsigned *)(sh_rec + 0xd0 + 0x14) = per - (33306 - 31979);
-    sh_poke(SH_TGTAB + 4 * 46, (unsigned)sh_rec);
-    sh_poke(SH_TGTAB + 0xe4 + 4 * 46, (unsigned)sh_rec + 0xd0);
-    sh_poke(SH_CACHE41 + 0x1c, per);
+    ((fn2)FN_DCLEAN)((unsigned)sh_rec, 0x130);
+    if (cur != (unsigned)sh_rec) {
+        sh_poke(SH_TGTAB + 4 * 46, (unsigned)sh_rec);
+        sh_poke(SH_TGTAB + 0xe4 + 4 * 46, (unsigned)sh_rec + 0xd0);
+    }
+    if (update_cache) {
+        sh_poke(SH_CACHE41 + 0x1c, per);
+        sh_armed_fps = pr->fps;
+    }
     return 1;
+}
+static int sh_handle_nav(int zoom)   // v174: UP/DOWN = field, LEFT/RIGHT = value. 1 = changed, 2 = preview geometry
+{
+    static unsigned prev = 0, t_rep = 0;
+    unsigned cur = (kbd_is_key_pressed(KEY_LEFT) ? 1u : 0u)
+                 | (kbd_is_key_pressed(KEY_RIGHT) ? 2u : 0u)
+                 | (kbd_is_key_pressed(KEY_UP) ? 4u : 0u)
+                 | (kbd_is_key_pressed(KEY_DOWN) ? 8u : 0u);
+    unsigned edge = cur & ~prev, ret = 1;
+    int d;
+    if (!edge && (cur & 3) && get_tick_count() - t_rep > 350) edge = cur & 3;   // hold LEFT/RIGHT = repeat
+    if (edge) t_rep = get_tick_count();
+    prev = cur;
+    if (!edge) return 0;
+    if (edge & 4) { sh_field = (sh_field + SH_NFIELD - 1) % SH_NFIELD; return 1; }
+    if (edge & 8) { sh_field = (sh_field + 1) % SH_NFIELD; return 1; }
+    d = (edge & 2) ? 1 : -1;
+    switch (sh_field) {
+    case 0: sh_iso_i = (sh_iso_i + SH_NISO + d) % SH_NISO; sh_expo_apply(); break;
+    case 1: sh_tv_i = (sh_tv_i + SH_NTV + d) % SH_NTV; sh_expo_apply(); break;
+    case 2: {
+        int lo = shooting_get_min_av96(), hi = shooting_get_max_av96(), v = sh_av96;
+        if (lo < 0 || hi <= lo) { sh_say("OUVERTURE", "indisponible"); break; }
+        if (!v) v = d > 0 ? lo : hi;                      // AUTO -> widest (RIGHT) or smallest (LEFT)
+        else { v += 32 * d; if (v < lo || v > hi) v = 0; }   // 1/3 stop; past either end -> AUTO
+        sh_av96 = v;
+        sh_av_apply();
+        break;
+    }
+    case 3:
+        sh_prof_idx = (sh_prof_idx + SH_NPROF + d) % SH_NPROF;
+        sh_arm_fps(sh_prof(), !zoom);
+        sh_expo_apply();                                  // Tv lines depend on the frame length
+        if (zoom && sh_prof()->fps != sh_armed_fps) sh_say("CADENCE: SORTIR/RENTRER x5", 0);
+        break;
+    case 4: pv_zebra = !pv_zebra; break;
+    default: pv_full = !pv_full; ret = 2; break;
+    }
+    return ret;
 }
 static int sh_next_take(void)   // first free A/M10_NNNN.MLV
 {
@@ -4330,78 +4819,86 @@ static void sh_uninstall(void)   // v162: hand the camera back to Canon (USB plu
         sh_poke(SH_CACHE41 + 0x1c, 33306);
     }
     if (sh_stub && *(volatile unsigned *)SH_CBR == (((unsigned)sh_stub + 0x10) | 1)) sh_poke(SH_CBR, SH_CANONCBR);
+    sh_expo_off();                                            // v174: Canon owns exposure again
     if (sh_hook && *(volatile unsigned *)SH_PTR == (((unsigned)sh_hook + 0x10) | 1)) sh_poke(SH_PTR, SH_ORIG);   // poke32 runs from the hook code itself, still in RAM
     sh_hook = 0;
 }
 static void shell_task(void)
 {
-    unsigned t_draw = 0;
+    static int osd_saved = -1;
     sh_on = 1;
-    slog("v160 shell start", 0, 0);
-    if (sh_usb()) { strcpy(msg, "SHELL: USB branche, arret"); sh_say(msg, 0); goto out; }   // v162
-    if (!sh_install_hook()) { strcpy(msg, "SHELL: hook refuse"); sh_say(msg, 0); goto out; }
-    if (!sh_arm_25p()) { strcpy(msg, "SHELL: 25p refuse"); sh_say(msg, 0); goto out; }
+    slog("v174 shell start", 0, 0);
+    osd_saved = conf.show_osd; conf.show_osd = 0;                    // v174: no CHDK OSD (DNG/space/batt/clock/temp)
+    draw_restore();
+    if (sh_usb()) { sh_say("USB branche", "shell arrete"); goto out; }   // v162
+    if (!sh_install_hook()) { sh_say("ERREUR", "hook capteur refuse"); goto out; }
+    if (!sh_arm_fps(sh_prof(), 1)) { sh_say("ERREUR", "cadence refusee"); goto out; }
     slog("v160 hook %x rec46 %x", (unsigned)sh_hook, *(volatile unsigned *)(SH_TGTAB + 4 * 46));
+    sh_expo_apply();
+    sh_av_apply();
+    remove("A/M10SH.END");
+    sh_say("M10 CINE", "touche la loupe x5");
     for (;;) {
         unsigned h = shamem(0xc0f06804), kb;
-        int zoom = (h == 0x045702a6);
+        int zoom = (h == 0x045702a6), nv;
+        const sh_prof_t *pr = sh_prof();
         sh_install_trap();                                    // lost at each magnifier entry / exit: re-arm always
         sh_gui_assert();                                      // v161
+        if (!zoom && sh_armed_fps != pr->fps) sh_arm_fps(pr, 1);
+        nv = sh_handle_nav(zoom);
+        if (nv == 2) pv_geom();
         kb = GetFreeCardSpaceKb();
-        if (get_tick_count() - t_draw > 500) {
-            t_draw = get_tick_count();
-            sprintf(sh_line, "%u Mo libres  %u mV  prise %04u", kb >> 10, stat_get_vbatt(), sh_take + 1);
-            sh_say(zoom ? "PRET 25p 2304x1076 - REC/SET" : "M10 CINE : touche la loupe x5", sh_line);
-        }
-        {   // v164: redraw the radar as soon as the magnifier moves
-            static int last_x0 = -1, last_y0 = -1;
-            volatile int *mr = (volatile int *)SH_MAGRECT;
-            if (zoom && (mr[2] != last_x0 || mr[3] != last_y0)) { last_x0 = mr[2]; last_y0 = mr[3]; sh_dirty = 1; }
-        }
-        sh_redraw(0);
-        if (sh_usb()) { sh_say("M10 CINE : USB, sortie", 0); break; }   // v162: PC connection -> leave
-        if (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET)) { sh_say("M10 CINE : sortie", 0); break; }   // MENU + SET: quit the shell
-        if (zoom && !sh_pv_off && kb >= 600 * 1024) {           // v165: live B&W preview from our RAW until a key
+        sh_hud(nv != 0);
+        if (sh_usb()) { sh_say("USB branche", "sortie"); break; }      // v162: PC connection -> leave
+        if (sh_quit_req || (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET))) { sh_say("M10 CINE", "sortie"); break; }   // v176: MENU held 1 s (or MENU + SET)
+        if (zoom && kb >= 600 * 1024) {                        // v165: live B&W preview from our RAW until a key
             sh_stop_req = 0; sh_pv = 1;
-            sh_say("APERCU RAW - REC/SET = prise, MENU = off", sh_line); sh_redraw(1);
+            sh_pv_hud();
             lv_x3();
             sh_pv = 0;
-            if (sh_pv_key == 3) { sh_pv_off = 1; sh_say("APERCU OFF (MENU = reprendre)", 0); sh_redraw(1); unsigned t = get_tick_count(); while (kbd_is_key_pressed(KEY_MENU) && get_tick_count() - t < 3000) msleep(20); msleep(300); continue; }
-            if (sh_pv_key == 6) { sh_pv_off = 1; sh_say("APERCU: erreurs capture, off", 0); sh_redraw(1); msleep(1000); continue; }
-            if (sh_pv_key != 1 && sh_pv_key != 2) { msleep(100); continue; }   // left the magnifier / USB: loop re-checks
-            sh_key = (sh_pv_key == 1) ? KEY_VIDEO : KEY_SET;
+            if (sh_pv_key == 3) { sh_say("M10 CINE", "sortie"); break; }
+            if (sh_pv_key == 6) { sh_say("APERCU EN ERREUR", "REC reste possible"); sh_hud(1); msleep(1000); }
+            if (sh_pv_key != 1 && sh_pv_key != 2) {           // left the magnifier / USB / preview error: loop re-checks
+                if (sh_pv_key == 5) sh_say("LOUPE QUITTEE", "touche la loupe x5");
+                if (sh_pv_key != 6) { msleep(100); continue; }
+                if (!(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
+            }
+            sh_key = (sh_pv_key == 2 || kbd_is_key_pressed(KEY_SET)) ? KEY_SET : KEY_VIDEO;
             sh_wait_release(); sh_stop_req = 0;
             zoom = (shamem(0xc0f06804) == 0x045702a6);
         } else {
-        if (sh_pv_off && zoom && kbd_is_key_pressed(KEY_MENU)) {           // MENU again: preview back on
-            sh_pv_off = 0; { unsigned t = get_tick_count(); while (kbd_is_key_pressed(KEY_MENU) && get_tick_count() - t < 3000) msleep(20); } continue;
+            if (kbd_is_key_pressed(KEY_MENU) || !(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
+            sh_key = kbd_is_key_pressed(KEY_VIDEO) ? KEY_VIDEO : KEY_SET;
+            sh_wait_release();
         }
-        if (!(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
-        sh_key = kbd_is_key_pressed(KEY_VIDEO) ? KEY_VIDEO : KEY_SET;
-        sh_wait_release();
-        }
-        if (!zoom) { sh_say("PAS EN LOUPE x5 : touche la loupe", 0); sh_redraw(1); msleep(800); continue; }
-        if (kb < 600 * 1024) { sh_say("CARTE PLEINE", 0); sh_redraw(1); msleep(1500); continue; }
-        if (!sh_next_take()) { sh_say("PLUS DE NUMERO LIBRE", 0); sh_redraw(1); msleep(1500); continue; }
-        sh_gui_assert(); sh_say("REC", xr_base + 2); sh_redraw(1); sh_rec_on = 1;
+        if (!zoom) { sh_say("PAS EN LOUPE", "touche la loupe x5"); sh_hud(1); msleep(800); continue; }
+        if (kb < 600 * 1024) { sh_say("CARTE PLEINE", 0); sh_hud(1); msleep(1500); continue; }
+        if (!sh_next_take()) { sh_say("PLUS DE NUMERO LIBRE", 0); sh_hud(1); msleep(1500); continue; }
+        sh_gui_assert();
+        sh_rec_on = 1; sh_rec_t0 = get_tick_count(); sh_l1[0] = 0; sh_hud_clear(); sh_hud(1);
         camera_set_led(4, 1, 0);
         sh_stop_req = 0;
         lv_x3();                                              // REC until stop / error / XR_MAX frames
         camera_set_led(4, 0, 0); sh_rec_on = 0;
         sh_wait_release(); msleep(300); sh_stop_req = 0;   // stop press must not start the next take
         sh_frames = xr_wr;
-        sprintf(sh_line, "%s : %u images  %s", xr_base + 2, sh_frames, msg);
+        sprintf(sh_line, "%u images%s%s", sh_frames, msg[0] ? "  " : "", msg);
         slog("v160 take %d frames=%d", sh_take, sh_frames);
-        sh_say("FIN DE PRISE", sh_line); sh_redraw(1);
+        sh_say(xr_base + 2, sh_line); sh_hud_clear(); sh_hud(1);
         msleep(1500);
     }
 out:
     sh_uninstall();                                           // v162
-    slog("v160 shell end: %s", (unsigned)msg, 0);
-    sh_redraw(1); msleep(1500);
+    slog("v174 shell end: %s", (unsigned)sh_l2, 0);
+    sh_hud_clear(); sh_hud(1); msleep(1500);
+    { unsigned y; for (y = 0; y < 240; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4); vid_bitmap_refresh(); }
+    if (osd_saved >= 0) conf.show_osd = osd_saved;
     sh_quit = 1;
     sh_on = 0;                                                // sh_kbd() now returns 0: keys go back to Canon
     if (sh_prev_gui && camera_info.state.gui_mode == GUI_MODE_MODULE) gui_set_mode(sh_prev_gui);
+    exit_alt();                                               // v176: leave CHDK ALT (kbd_blocked) -> Canon gets every key
+    { int fe = open("A/M10SH.END", O_WRONLY | O_CREAT | O_TRUNC, 0777); if (fe >= 0) { write(fe, "1\n", 2); close(fe); } }   // ends M10SHELL.LUA
+    sh_quit_req = 0;
     task_running = 0;
     ExitTask();
 }
@@ -4410,8 +4907,22 @@ static void sh_keywatch_task(void)
 {
     for (;;) {
         if (!sh_on) break;
-        if ((sh_key_down() || (sh_rec_on && sh_usb())) && !sh_stop_req) { sh_stop_req = 1; }   // v162: USB ends the take
+        {   // v176: MENU held 1 s = quit (not during a take); SET/REC ignored while MENU is down
+            static unsigned t_menu = 0;
+            if (kbd_is_key_pressed(KEY_MENU)) { if (!t_menu) t_menu = get_tick_count(); else if (!sh_rec_on && get_tick_count() - t_menu > 1000) sh_quit_req = 1; }
+            else t_menu = 0;
+        }
+        if (((sh_key_down() && !kbd_is_key_pressed(KEY_MENU)) || (sh_rec_on && sh_usb())) && !sh_stop_req) { sh_stop_req = 1; }   // v162: USB ends the take
         if (sh_rec_on) sh_gui_assert();                       // v161: keep REC away from Canon during a take
+        if (sh_rec_on) {                                      // v175: whole HUD redrawn at 1 Hz during a take (lowest-priority task)
+            static unsigned last = 0xffffffff, wiped = 0;
+            unsigned sec = (get_tick_count() - sh_rec_t0) / 1000;
+            if (sec != last) {
+                last = sec;
+                if (PV_RGBA[1 * PV_BW + 100] == 0 && wiped < 4) { wiped++; slog("v175 HUD wiped in RAM at %ds (n=%d)", sec, wiped); }   // erased vs not composited
+                sh_hud(1);                                    // redraw + vid_bitmap_refresh
+            }
+        }
         msleep(30);
     }
     ExitTask();
@@ -4425,9 +4936,9 @@ int _run()
         if (fs >= 0) {
             close(fs);
             task_running = 1; sh_quit = 0;
-            sh_say("M10 CINE : installation", 0);
+            sh_say("M10 CINE", "installation");
             CreateTask("M10Shell", 0x1A, 0x1000, shell_task);
-            CreateTask("M10Key", 0x1D, 0x800, sh_keywatch_task);
+            CreateTask("M10Key", 0x1D, 0x1000, sh_keywatch_task);   // v175: 4 KiB (draws the full HUD during REC)
             running = 0;                                      // return at once (called from the autostart script); the
             return 0;                                         // module stays loaded while task_running. Keys are kept
                                                               // from Canon by the script's ALT mode (kbd_blocked).
