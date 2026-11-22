@@ -1,6 +1,70 @@
 /*
+ * v185b (2026-11-22): Wide 1800 Standby + REC both arm at x_lo 37600 (V-blank after the 37018 us readout), Standby
+ *   x_need = h - 4; overlay sentinel moved from (30, 2) (overwritten by the yellow clip % -> mask/HUD/refresh storm)
+ *   to the mask corner (21, 358), Wide focus view: top HUD bar (1, 358); one pv_m1_mask(0) per M10PvS pass;
+ *   sh_m1_enter clears pv_has_img (full wipe after enter / geometry switch); 1440p -> non-1440p profile switch
+ *   under wb_wd_force + 400 ms settle (WBInteg.c:3491 assert).
+ * v185 (2026-11-22): ImgMode 1 profiles Wide 1800 10b (1728x1800, LCLK 640, FL 2080) and Wide 1440 12b/10b
+ *   (1728x1440, X0 0x30): sh_prof_t h/lclk/m1_wide, parameterized Extract/TgPixelRes/FldSpec/cache, wide CMOS 2/5/7
+ *   overrides, [0xfc3c] value handed to M10SHELL.LUA via siohook6 +0x280, geometry change -> full ImgMode 1 re-enter.
+ * v184c (2026-11-22): stability + standby speed. sh_pwr_lock(1) also calls SetAutoShutdownTime(0) (0xfc1fb4dd:
+ *   Canon Display-Off / idle timer cannot fire in long standby); key=5 diagnostic slog (0x865c, 0xe664, DSS_FLAGS,
+ *   mode_rec); SH_IPC_REC under wb_wd_force + M1_OFF first if 0x865c is still 1; pre-take [0xfc3c] != 2073 (Canon
+ *   ReEVF ran, MotionVector awake) -> log + full sh_m1_enter() instead of a blind poke; exit: wb_wd_force around
+ *   sh_m1_leave + 400 ms settle (WBInteg.c:3491 assert on MENU exit), MENU release wait (<= 3 s) before exit_alt
+ *   (no PressMenuButton leak). pv_render_m1: dedicated 10-bit full-res rows (fast: no peak / st == 2 state;
+ *   peak: own loop), p1 = p0 + 1200, branchless clip test, n counted per row (bit-identical to v184b).
+ * v184b (2026-11-22): pv_render_m1 fast path: PV_HOT back to O2 (module built with -mword-relocations), pre-shifted
+ *   u32 LUTs (px = lr[R] | lg[G] | lb[B], subtle cinema S-curve baked in), no 2-quad average / saturation pass,
+ *   per-column word / shift tables, one inner loop per bit depth (no bpp test per pixel); standby ring up to 8 EXMEM
+ *   slots (torn 297 -> 0), dflush timed apart (fl_avg), M10PvS msleep(5) per frame; REC 4:3 always 134 x 100,
+ *   1:1 punch-in full res + peaking while the encoder keeps up, 30 ms pace.
+ * v184a (2026-11-22): ImgMode 1 preview: fixed REC-view R/G/B LUTs + saturation x1.35, 4:3 2-quad average,
+ *   output-grid peaking (no unpack), sampled-row dflush; REC preview renders the newest captured frame (no 1 s
+ *   wait, 40 ms pace, half res on encoder lag); standby async render task M10PvS on a 3-slot capture ring;
+ *   half-press toggles 4:3 <-> 1:1 in standby and REC (Canon AF dip removed).
+ * v183d (2026-11-22): pv_render_m1 precomputes col_x[] (53,600 __aeabi_uidiv out of the inner loop) and builds each
+ *   row in a cached row_px[] flushed to uncached PV_RGBA by burst memcpy (ren=150 ms); M10SHELL do_af waits for
+ *   Canon idle Photo M (ImgSens 3, TG 3, !shooting) after the half-press release (M1_ON mid-CancelPre ->
+ *   WBInteg.c:2197 ASSERT).
+ * v183c (2026-11-22): WB watchdog keepalive across the half-press AF dip (wb_wd_force + wb_kick_now: ROMLOG
+ *   WBInteg.c:3491 ASSERT power-off when 0x865c 1 -> 3 stopped M10WB during PressSwOne); standby preview flushes
+ *   only the sampled rows (1:1 281 KB, 4:3 960 KB instead of 3.45 MB), sleep 15 -> 5 ms, frame-1 ms breakdown log.
+ * v183b (2026-11-22): x_pbl 220 -> 350 (13 v62 dfe_miss on take 32); instant half-press AF latch (sh_af_req, keywatch);
+ *   standby 1440p preview from the CACHED frame (FN_DFLUSH invalidate, was 0x40000000 uncached: ~380 ms/frame),
+ *   fused 2-sample reads, 4:3 peaking on a true 2-photosite gradient (c-2 / c+2), mean EMA, HUD 1/8, sleep 15 ms.
+ * v183 (2026-11-22): x_pbl 560 -> 220 (SH_RECIPE_M1 field 55); focus peaking in pv_render_m1 (pv_peak, HUD Z+P/PK/ZEB/---);
+ *   one-shot Canon hybrid AF dip (half-press in the 1440p preview -> SH_IPC_AF 5, then re-arm ImgMode 1);
+ *   24.00p cadence: 2 pre-roll captures, VIDF timestamps = (k + drops before k) * x_per (64-bit), mlv_fps1000 from
+ *   slots; early-drop fixes: WB readout kick held for fr 0..7 (<= 1 s) and while the encoder is >= 2 behind (<= 900 ms),
+ *   REC preview starts 1 s in, every 500 ms, only with no encoder backlog and no ring drop in the last 500 ms.
+ * v182 (2026-11-22, work/v182_audit_spec.md): unified stand-alone 1440p shell.
+ *   A.5: independent WB watchdog task M10WB (prio 0x18): kicks WBIntegTask when WB_S+0x5c is stale (> 1.2 s in REC,
+ *        > 0.6 s idle) in ImgMode 1; wb_kick_due() also on the ring-full drop path; deferred log kept through the
+ *        whole REC report (SLOG_BUF 8192, one flush); heartbeat skipped in the shell; xr_roll time/count; TLF/CAP
+ *        rings circular (TLF2 when wrapped); mlv_finalize without stdio; 12b LL unpacker reset; LockMainPower held
+ *        while the shell runs; M10Shell/M10Cine/M10XR stacks 0x2000.
+ *   C: profile kind (0 x5, 1 Film 1x3, 2 ImgMode 1 1440p, default); SH_RECIPE_M1; ImgMode 1 RAM tables
+ *        (Extract[3], TgPixelRes[9], FldSpec[9], cache[1]) and siohook6 overrides (CMOS 0/5/7, TG 8006/805f/8061)
+ *        owned by C; RAM IPC with the Lua (hook +0x220 request / +0x224 ack: 1 m1_on, 2 m1_off, 3 rec, 4 play,
+ *        0xE0 quit), no more A/M10X3.REQ/ACK; automatic ImgMode 1 arming in photo M, never re-switched after a take.
+ *   B: opaque overlay mask + opaque HUD in ImgMode 1 (Canon's YUV bars never show), HDMI guard, view 4:3 / 1:1 /
+ *        OFF, RGGB colour preview 10b/12b with fixed black 127, live preview task M10Pv during the take (2.8 Hz).
+ * v181c (2026-11-21): A/M10RUN.ASY -> _run returns at once (stand-alone Lua keeps the kbd task alive, so the
+ *        half-press / SET stop of flag 0x2000000 works); A/M10X3.END (msg) written when the take is over.
+ * v181b (2026-11-21): log RD1 (encoder read channel) registers +0x00..+0x20 as programmed (geometry tests).
+ * v181 (2026-11-21, r159/Fable A1): ImgMode 1 REC: asynchronous encoder collect/re-kick (lj_poll) from the CH12
+ *        readout loop and wait_dfe_w; raw ring 5 (was 3); compressed slots stop before WR2 (x_exsz - 0xC0000).
+ * v180f (2026-11-21, r159): ImgMode 1 REC: arm window hi = per - 1.2 ms; WB kick deferred to right after the CH12
+ *        start (inside the readout); 32 MiB warm-up write (FAT) + removal of the old take before opening the MLV.
  * m10_cine.flt - EOS M10 (fw 1.10d) RAW video.
  *
+ * v179 (2026-11-18, r153): A/M10TRG.CFG = hex address of a RAM trigger block: TG/DFE/CDS/CMOS writes before the
+ *   8830 sync of the first pass (pre) and right after its CH12 start (go), one-shot (Still readout test).
+ * v177 (2026-11-17): 12-bit compressed REC (Film 1x3, r137: 12b + MOVOFF=8 = full 1184 lines):
+ *   lj_on accepts lvn_bpp 12 (< 4 MiB encoder window), RD1 depth code 1 + LL unpacker 0x10 (<< 2 into
+ *   the 14-bit JpCore container), A/M10HUF12.BIN, compressed slots sized from the frame. MLV RAWI
+ *   stays 14-bit (black 2048, white 16383): samples are 12-bit << 2. 10/14-bit paths unchanged.
  * v176 (2026-11-16): Aperture field (F): CHDK shooting_set_av96_direct + Canon MoveIrisWithAv
  *   (0xfc43f6b9, CAM_AV_OVERRIDE_IRIS_FIX path), AUTO = untouched. Exit = hold MENU 1 s (MENU+SET
  *   kept); SET/REC ignored while MENU is down. On exit: exit_alt() so Canon gets the keys back and
@@ -291,6 +355,8 @@
 #include "sd_card.h"
 #include "debug_led.h"
 #include "stdio.h"
+#include "shooting.h"   // v178: shooting_set_playrec_mode, shooting_set_mode_chdk
+#include "modes.h"
 
 // ---- firmware 1.10d addresses (Thumb, +1) ----
 #define FN_RES_LOCK    0xfc373f9f
@@ -356,15 +422,20 @@ static cine_hdr hdr;
  * capture task cost ~60-80 ms and two sensor frames (live114: 133/133 lines
  * logged during REC were followed by a 2-slot gap). slog_flush() writes the
  * buffer once REC is over. Overflow is counted, never blocks. */
-#define SLOG_BUF 4096
+#define SLOG_BUF 8192   // v182: 4096 -> 8192 (REC report deferred too)
 static char slog_buf[SLOG_BUF];
 static unsigned slog_len = 0, slog_lost = 0, slog_defer = 0;
 static volatile unsigned sh_on = 0, sh_stop_req = 0;   // v160 shell
+static volatile unsigned sh_rec_on = 0;                // v182: moved up (WB watchdog idle rule)
 static volatile unsigned sh_quit_req = 0;              // v176: MENU held 1 s
 static volatile unsigned sh_pv = 0, sh_pv_key = 0, sh_pv_n = 0, sh_pv_off = 0;   // v165: live preview from our RAW (shell, x5)
 // v167: zoom REC recipe base (r116_m1 + x_need=1102 guard against short/empty frames); width/crop overridden by sh_profs
 // v174: = r132 qualified line (m10x3raw.py zoom ... HEFIX=1 RSEL=10 CSH=0 ENC=11 EXM=48 HBN=16 HER=1 SKICK=1 NS='1 0 2'
 //   KW=8000), with 3000 frames, x_need=1102 kept (short-frame guard), CSH 0 (14-bit), HBN 16.
+// v178: Film 1x3 12-bit PREFIFO recipe (= r147 run F / r149 deliverable: line 640, EW 1536, EH 1156, EOFF 76140, RSEL 22)
+#define SH_RECIPE_X3 "3000 1184 12 0 0 562039168 0 80000003 5000 11000 6 0 0 12 4 99 0 0 11 0 0 a0:0 9 0 0 35 1156 0 0 0:0 1 0 2 0 0 256 1 1 0 0 1536 0 0 8000 76140 0 16 0 0 0 0 1 48 0 1 0 22\n"
+// v182: ImgMode 1 1920x1440 recipe (= M10M1.LUA mlv_cfg minus bit 0x2000000: shell keywatch owns STOP; per 41666: lo 35166, hi 39166 -> per - 1200)
+#define SH_RECIPE_M1 "3000 1440 10 0 0 553650560 0 80000003 35166 39166 6 1436 0 12 4 99 0 0 11 0 0 a0:0 9 0 0 35 1440 0 0 0:0 1 0 2 0 0 256 1 1 0 0 0 0 0 8000 0 0 16 0 0 0 0 1 48 350 1 0 10 1\n"
 #define SH_RECIPE "3000 1104 14 0 0 553650560 0 80000003 5000 11000 6 1102 0 12 4 99 0 0 11 0 0 a0:0 9 0 0 35 0 0 0 0:0 1 0 2 0 0 256 1 1 0 0 2048 0 0 8000 532 0 16 0 0 0 0 1 48 0 1 0 10 1\n"
 static void slog(const char *fmt, unsigned a, unsigned b)
 {
@@ -1060,6 +1131,7 @@ static unsigned enc_bits = 2;                  // v92: encoder input depth code 
 // uses 10 bits, unpacker 0xc0f371fc = depth << 4), only JpCore (0xfc58228a) insists on 12/14.
 // enc_rd10: set up as 14-bit, then redo the RD1 EDMAC (0xfc581e30, depth 0) and the unpacker.
 static unsigned enc_rd10 = 0, enc_unpk = 0, enc_prec = 0, enc_9c = 0;
+static unsigned enc_rd12 = 0;   // v177: RD1 depth code 1 (12-bit source) in REC
 static unsigned enc_mode = 1;   // v130
 static unsigned lj_rdf = 0;    // v147: 52nd field = RD1 transfer-size flag bits (hex)
 static unsigned lj_ebits = 0;   // v146: 51st field = encoder depth code override (1 = P12, 2 = P14), 0 = default
@@ -1116,7 +1188,7 @@ static unsigned enc_frame(char *buf, unsigned phys, unsigned in_off, unsigned *e
     if (enc_rd10) {                     // v95: hardware 10-bit unpack
         static unsigned geo[6];
         geo[0] = 0; geo[1] = enc_w; geo[2] = 0; geo[3] = 0; geo[4] = enc_h; geo[5] = 0;
-        ((fn7)FN_LL_RD1)((unsigned)geo, (enc_wov && !enc_wstride) ? x_w : enc_w, enc_h, 0, 0, 0, phys + enc_in_off + in_off);   // v133: source stride
+        ((fn7)FN_LL_RD1)((unsigned)geo, (enc_wov && !enc_wstride) ? x_w : enc_w, enc_h, 0, 0, enc_rd12 ? 1 : 0, phys + enc_in_off + in_off);   // v177: depth code 1 = 12-bit source   // v133: source stride
         if (enc_rdb == 1) ((fn1)0xfc3759ab)(enc_rd); else if (enc_rdb == 2) ((fn1)0xfc3759c3)(enc_rd); else if (enc_rdb == 3) ((fn1)0xfc3759db)(enc_rd);
         if (lj_rdf) { unsigned fa = rd_base(enc_rd) + 4; eng_out(fa, (shamem(fa) & ~0x60001000u) | lj_rdf); }   // v147: raw RD1 transfer-size bits (0x20001000 = 8 B, 0x40001000 = 16 B)   // v134: Canon burst setters (4 B / 0x1000 / 16 B), after RD1 programming
         eng_out(LL_UNPACK_REG, enc_unpk);
@@ -1144,6 +1216,7 @@ static unsigned enc_frame(char *buf, unsigned phys, unsigned in_off, unsigned *e
     return sz;
 }
 static unsigned enc_u0;   // v125
+static unsigned enc_rdg[9];   // v181b
 static unsigned enc_begin(char *buf, unsigned phys, unsigned in_off)
 {
     static unsigned cfg[9] = { 0x23, 0, 9, 0, 0, 0, 0, 1, 0 };
@@ -1178,7 +1251,7 @@ static unsigned enc_begin(char *buf, unsigned phys, unsigned in_off)
     if (enc_rd10) {                     // v95: hardware 10-bit unpack
         static unsigned geo[6];
         geo[0] = 0; geo[1] = enc_w; geo[2] = 0; geo[3] = 0; geo[4] = enc_h; geo[5] = 0;
-        ((fn7)FN_LL_RD1)((unsigned)geo, (enc_wov && !enc_wstride) ? x_w : enc_w, enc_h, 0, 0, 0, phys + enc_in_off + in_off);   // v133: source stride
+        ((fn7)FN_LL_RD1)((unsigned)geo, (enc_wov && !enc_wstride) ? x_w : enc_w, enc_h, 0, 0, enc_rd12 ? 1 : 0, phys + enc_in_off + in_off);   // v177: depth code 1 = 12-bit source   // v133: source stride
         if (enc_rdb == 1) ((fn1)0xfc3759ab)(enc_rd); else if (enc_rdb == 2) ((fn1)0xfc3759c3)(enc_rd); else if (enc_rdb == 3) ((fn1)0xfc3759db)(enc_rd);
         if (lj_rdf) { unsigned fa = rd_base(enc_rd) + 4; eng_out(fa, (shamem(fa) & ~0x60001000u) | lj_rdf); }   // v147: raw RD1 transfer-size bits (0x20001000 = 8 B, 0x40001000 = 16 B)   // v134: Canon burst setters (4 B / 0x1000 / 16 B), after RD1 programming
         eng_out(LL_UNPACK_REG, enc_unpk);
@@ -1188,6 +1261,7 @@ static unsigned enc_begin(char *buf, unsigned phys, unsigned in_off)
     enc_f_rd = shamem(rd_base(enc_rd) + 4); enc_f_wr = shamem(0xc0f04000 + 0x100 * enc_wr1 + 4);   // v111
     { unsigned i; for (i = 0; i < x_epn; i++) eng_out(x_epa[i], x_epm[i] ? (shamem(x_epa[i]) | x_epv[i]) : x_epv[i]); }   // v111
     if (enc_rd10 && lj_u371) eng_out(LL_UNPACK_REG, lj_u371);   // v145: raw unpacker value for REC encodes
+    { unsigned i, b = rd_base(enc_rd); for (i = 0; i < 9; i++) enc_rdg[i] = shamem(b + 4 * i); }   // v181b: RD1 geometry as programmed (+0x00..+0x20)
     enc_u0 = usec();
     ((fn0)FN_LL_START)();
     return 1;
@@ -1858,7 +1932,7 @@ static unsigned lvn_bpp = 14, lvn_lb = LVN_LB;  // v26: lv_x3 bit depth
 // v168z (2026-11-15): the x5 magnifier with a taller head (m10zoomtall.py: 6804 = H<<16 | 0x2a6, H 1111..1300)
 // counts as zoom in lv_x3 (width 2592, lines up to H - 7) so the hold-line position can be measured.
 static int zoom_head(unsigned h) { unsigned hh = h >> 16; return (h & 0xffff) == 0x2a6 && hh >= 1111 && hh <= 1300; }
-static unsigned x_w = LVN_W, x_per = 40000, x_zoom = 0;   // v156: frame width (2592 in the x5 magnifier), frame period us, zoom flag
+static unsigned x_w = LVN_W, x_per = 40000, x_zoom = 0, x_m1 = 0;   // v156/v180: frame width, period us, zoom flag, ImgMode 1 flag
 static unsigned lvn_post_ms = 0;    // v33: wait after the DMA end before stop/restore
 static unsigned tl_step = 1000;     // v34: timeline spacing (us); calibration: 250 us, busy poll
 // v30: per-ms timeline of the current pass
@@ -1907,9 +1981,10 @@ static unsigned pk_late = 0;       // v58: frames skipped because PACK32 was bus
 static volatile unsigned xr_gate = 1;   // v39: 0 while our CH12/PACK32 transfer runs (no card write)
 static int *lj_sem_p = 0;   // v121
 static void (*x_kick)(unsigned fr) = 0;   // v125
+static void (*x_poll)(void) = 0;           // v181: async encoder collect / re-kick from the capture task's wait loops (m1 REC)
 static unsigned lj_chase = 0, lj_chased = 0, lj_chase_n = 0, lj_chase_miss = 0;   // v144: 49th field = start the encoder on the frame being read, at this CH12 line (0 = at DMA end)
 static volatile unsigned lj_kicked;   // v144: forward (defined with the LJ state)
-static unsigned x_dr[3];   // v126: drop reasons (ring full, he, PACK32 busy): starts the encoder on frame fr from the capture task
+static unsigned x_dr[3];   // v126: drop reasons (ring full, he, PACK32 busy)
 static volatile unsigned lj_cnt = 0;   // v124
 static unsigned lj_on = 0, x_he_fix = 0;   // v172: forward for lvn_cap
 // v140: per-frame timeline (20-bit us, bit 31 = set): 0 CH12 armed, 1 first line moved, 2 DMA end, 3 encoder start, 4 encoder CBR, 5 SD write start, 6 SD write end
@@ -1925,7 +2000,10 @@ static unsigned lj_on = 0, x_he_fix = 0;   // v172: forward for lvn_cap
 static unsigned (*capl)[5] = 0, cap_k = 0xffffffff, cap_n = 0;
 static unsigned cap_path = 0, cap_miss0 = 0;
 static unsigned tlf[TLF_N][8];
-static void tlf_set(unsigned fr, unsigned i, unsigned v) { if (fr < TLF_N) tlf[fr][i] = v | 0x80000000u; if (!fr && i == 1) ts_first_readout(v); }
+// v182: TLF and CAP are rings (row = frame % TLF_N, record = pass % CAP_N) so the ~740th frame (xr_roll) is traced;
+// rows are cleared when their frame / pass starts. Export order is chronological (TLF2 + first frame when wrapped).
+#define TLF_ROW(fr) tlf[(fr) % TLF_N]
+static void tlf_set(unsigned fr, unsigned i, unsigned v) { TLF_ROW(fr)[i] = v | 0x80000000u; if (!fr && i == 1) ts_first_readout(v); }
 static unsigned x_skick = 0, x_skick_n = 0;   // v151: 56th field = 1: kick the encoder on kept short frames too
 static unsigned x_pbl = 0;   // v150: 55th field = busy-poll the last N lines of a readout (0 = last quarter)
 static volatile unsigned x_dma_live = 0, x_dma_t1 = 0, x_early = 0, x_early_fr = 0, x_ready = 0;   // v121: early publish of a complete frame at DMA end   // v119: CH12 lines moving (readout in progress); usec of the last DMA end
@@ -2075,6 +2153,11 @@ static void wr_init(void)
 static unsigned x_dly_us = 6000, x_dfe_ts = 0, x_dfe_miss = 0, x_dma_sio = 0;
 // from = ring index to scan from (0: now); post = 1: an entry already past
 // its delay is accepted at once (restore after our DMA end).
+static int is_sync_evt(volatile unsigned *e)   // v180: DFE 8830 in LV/Zoom, CMOS 0 in ImgMode 1
+{
+    if (x_m1) return e[4] == 0xfc1bec0f && ((e[5] >> 12) & 0xf) == 0;
+    return e[4] == 0xfc1bd4e3 && e[5] == 0x8830;
+}
 static int wait_dfe(unsigned tmo_ms, unsigned dly_us, unsigned from, int post)
 {
     unsigned sb = sio_base(), i0, i, t0 = get_tick_count(), nm1;
@@ -2086,7 +2169,7 @@ static int wait_dfe(unsigned tmo_ms, unsigned dly_us, unsigned from, int post)
         wr_poll();
         for (i = i0; i != i1; i++) {
             volatile unsigned *e = (volatile unsigned *)(sb + sio_ring + 64 * (i & nm1));
-            if (e[4] == 0xfc1bd4e3 && e[5] == 0x8830) {
+            if (is_sync_evt(e)) {
                 unsigned ts = e[0] & 0xfffff, late = udiff(ts, usec());
                 if (late > 30000) continue;               // stale
                 if (!post && late > dly_us + 3000) { x_dfe_miss++; continue; }
@@ -2113,11 +2196,11 @@ static int dfe_seen(unsigned from, unsigned age)
     i1 = *(volatile unsigned *)(sb + 0x204);
     for (i = from; i != i1; i++) {
         volatile unsigned *e = (volatile unsigned *)(sb + sio_ring + 64 * (i & nm1));
-        if (e[4] == 0xfc1bd4e3 && e[5] == 0x8830 && udiff(e[0] & 0xfffff, usec()) >= age) return 1;
+        if (is_sync_evt(e) && udiff(e[0] & 0xfffff, usec()) >= age) return 1;
     }
     return 0;
 }
-static unsigned last_8830(void)   // v109: timestamp (20-bit us) of the most recent DFE 8830 in the SIO ring, 0 = none
+static unsigned last_8830(void)   // v109: timestamp (20-bit us) of the most recent DFE 8830 (or CMOS 0 in m1) in the SIO ring, 0 = none
 {
     unsigned sb = sio_base(), i, i1, nm1, n;
     if (!sb) return 0;
@@ -2127,7 +2210,7 @@ static unsigned last_8830(void)   // v109: timestamp (20-bit us) of the most rec
         volatile unsigned *e;
         i--;
         e = (volatile unsigned *)(sb + sio_ring + 64 * (i & nm1));
-        if (e[4] == 0xfc1bd4e3 && e[5] == 0x8830) return (e[0] & 0xfffff) | 0x80000000;
+        if (is_sync_evt(e)) return (e[0] & 0xfffff) | 0x80000000;
     }
     return 0;
 }
@@ -2136,6 +2219,41 @@ static unsigned x_abort = 0;    // v69: passes cut at the frame's 8830
 // 2 = chain: restore + next start inside the same 8830 window (one pass per frame),
 // 4 = PACK32 pack 4 + CH12 flag 0x1000.
 static unsigned x_xo = 0, x_lo = 1000, x_hi = 7000, x_hi_post = 30000;
+// v179 (r153): one-shot trigger around the CH12 start of the first pass. RAM block (host-written):
+//   [0] 'TRG1' magic, [1] n_pre, [2] n_go, then (n_pre + n_go) pairs {kind, reg | val << 16}
+//   kind 0 TgWrite, 1 DfeWrite, 2 CdsWrite, 3 CMOS (0xfc1bebfb), 4 wait val ms (busy, usec)
+//   pre-list before CH12 start, go-list right after it; ring index re-read after the go-list
+//   (our DFE writes must not look like this frame's 8830).
+static unsigned *x_trg = 0, x_trg_done = 0, x_trg_us = 0;
+static unsigned trg_busy = 0, trg_skip = 0;
+static int trg_open_pair(void)   // last ch4 frame in the SIO ring = an address frame (Canon pair still open)?
+{
+    unsigned sb = sio_base(), i1, nm1;
+    volatile unsigned *e;
+    if (!sb) return 0;
+    nm1 = *(volatile unsigned *)(sb + 0x210);
+    i1 = *(volatile unsigned *)(sb + 0x204);
+    e = (volatile unsigned *)(sb + sio_ring + 64 * ((i1 - 1) & nm1));
+    return (e[4] == 0xfc231323 || e[4] == 0xfc1bd4e3 || e[4] == 0xfc414d41 || e[4] == 0xfc35b5e9) &&
+           udiff(e[0] & 0xfffff, usec()) < 3000;
+}
+static void trg_run(const unsigned *e, unsigned n)
+{
+    unsigned i;
+    for (i = 0; i < n; i++, e += 2) {
+        unsigned k = e[0], r = e[1] & 0xffff, v = e[1] >> 16, ps, u;
+        if (k == 4) { msleep(v > 500 ? 500 : v); continue; }
+        u = usec();
+        while (trg_open_pair()) { if (udiff(u, usec()) > 4000) { trg_skip++; break; } }
+        if (trg_open_pair()) trg_busy++;
+        __asm__ volatile("mrs %0, cpsr\n\tcpsid i" : "=r"(ps) :: "memory");
+        if (k == 0) ((fn2)0xfc231309)(r, v);
+        else if (k == 1) ((fn2)0xfc1bd4c9)(r, v);
+        else if (k == 2) { unsigned w = e[1]; ((fn1)0xfc414d25)((unsigned)&w); }
+        else if (k == 3) ((fn2)0xfc1bebfb)(r, v & 0xfff);
+        __asm__ volatile("msr cpsr_c, %0" :: "r"(ps) : "memory");
+    }
+}
 static unsigned x_busy_max = 0, x_busy_tot = 0, x_waits = 0, x_ref_tick = 0, x_late_acc = 0;
 static int sdiff(unsigned a, unsigned b) { return (int)(((b - a + 0x80000) & 0xfffff)) - 0x80000; }
 // Returns 1 at a time in [ts + lo, ts + hi] of a NEW 8830 (ring scanned from
@@ -2153,15 +2271,16 @@ static int wait_dfe_w(unsigned tmo_ms, unsigned from, unsigned hi, unsigned acc)
     while (get_tick_count() - t0 < tmo_ms) {
         unsigned i1 = *(volatile unsigned *)(sb + 0x204), now;
         wr_poll();
+        if (x_poll) x_poll();   // v181
         if (x_he_n) tg_fix(0);   // v89q: ~1 ms latency
         for (i = i0; i != i1; i++) {
             volatile unsigned *e = (volatile unsigned *)(sb + sio_ring + 64 * (i & nm1));
-            if (e[4] == 0xfc1bd4e3 && e[5] == 0x8830) {
+            if (is_sync_evt(e)) {
                 unsigned ts = e[0] & 0xfffff, late = udiff(ts, usec());
-                if (late > 30000) continue;               // stale
+                if (late > (x_m1 ? 48000u : 30000u)) continue;               // stale (v180d: m1 restore at +34 ms)
                 x_dfe_ts = ts; x_ref_tick = get_tick_count();
                 if (late > acc) { x_dfe_miss++; continue; } // window gone: next frame
-                while (udiff(ts, usec()) < x_lo) ;
+                for (;;) { unsigned el = udiff(ts, usec()); if (el >= x_lo) break; if (x_m1 && x_lo - el > 14500) msleep(1); }
                 sync_late_us = late; x_late_acc += late;
                 if (ub) { unsigned bt = udiff(ub, usec()); x_busy_tot += bt; if (bt > x_busy_max) x_busy_max = bt; }
                 x_waits++;
@@ -2173,10 +2292,10 @@ static int wait_dfe_w(unsigned tmo_ms, unsigned from, unsigned hi, unsigned acc)
         if (x_dfe_ts && get_tick_count() - x_ref_tick < 400) {
             int d = sdiff(x_dfe_ts, now);                 // now - last 8830
             while (d >= (int)hi) d -= (int)x_per;         // relative to the next predicted one (v156: x_per)
-            if ((int)x_lo - d > 10500) { if (ub) { x_busy_tot += udiff(ub, now); ub = 0; } msleep(1); continue; }   // v72b: wake before the window START
+            if ((int)x_lo - d > (x_m1 ? 14500 : 10500)) { if (ub) { x_busy_tot += udiff(ub, now); ub = 0; } msleep(1); continue; }   // v72b/v180c: wake before the window START (m1: 14.5 ms tick guard)
             if (!ub) ub = now;
-            if (x_early && !x_kick && lj_cnt < x_ready && (int)x_lo - d > 3000) { msleep(1); continue; }   // v124: an early frame is waiting for the encoder: sleep (10 ms tick) so the encoder task can start, if the window is > 3 ms away
-        } else msleep(1);                                 // no reference yet
+            if (!x_m1 && x_early && !x_kick && lj_cnt < x_ready && (int)x_lo - d > 3000) { msleep(1); continue; }   // v124: an early frame is waiting for the encoder: sleep (10 ms tick) so the encoder task can start, if the window is > 3 ms away
+        } else if (!x_m1) msleep(1);                      // no reference yet (v180b: busy-poll first CMOS 0 in m1)
     }
     return 0;
 }
@@ -2205,6 +2324,81 @@ static unsigned x_he_frz = 0;   // v89g
 // the frame callback 0xfc2c9f4e (0x2400) copies +0x50 -> +0x54. Track when each pointer last moved.
 #define WB_S 0xc6f0
 static unsigned wb_last[4], wb_tick[4], wb_max[4], wb_logged = 0, wb_kick_n = 0;   // v89j: kicks
+static unsigned wb_defer = 0, wb_due = 0, wb_late_n = 0;   // v180f: m1 REC defers the WB kick into the readout
+static unsigned x_warm = 32;                               // v180f: MiB pre-written before an m1 take (0 = off)
+static volatile unsigned wb_last_kick_ms = 0;              // v182: last WBIntegTask kick from any path (wb_mon, wb_kick_due, M10WB)
+static volatile unsigned xr_prod;   // v183: forward (defined with the XR state below)
+static void wb_kick_due(unsigned fr)   // v180f: called right after eng_out(CH12, 1)
+{
+    unsigned fv = 0, now;
+    if (!wb_due) return;
+    now = get_tick_count();
+    if (x_m1 && wb_defer) {   // v183: no kick in the first 8 frames, nor while the encoder is >= 2 behind (safety 1 s / 900 ms)
+        if (fr < 8 && now - wb_last_kick_ms <= 1000) return;
+        if (fr >= 8 && lj_on && (int)(xr_prod - lj_cnt) >= 2 && now - wb_last_kick_ms <= 900) return;
+    }
+    wb_due = 0;
+    ((fn2)0xfc314b44)(*(volatile unsigned *)(WB_S + 0x20), (unsigned)&fv);
+    ((fn2)0xfc314c94)(*(volatile unsigned *)(WB_S + 0x20), 0x20050);
+    if (wb_kick_n < 8) slog("v180f wb kick (readout) fr=%d flag=%x", fr, fv);
+    wb_kick_n++; wb_late_n++; wb_tick[3] = now; wb_tick[2] = now; wb_last_kick_ms = now;
+}
+/* v182 (spec A.5-1): WBInteg watchdog, independent task M10WB (prio 0x18, above the capture 0x1A).
+ * In the stand-alone shell nothing else feeds WBIntegTask (the host daemon of the USB runs is gone):
+ * any window of ~3 s without WB statistics in ImgMode 1 = ASSERT WBInteg.c:3491 then power-off.
+ * The task tracks WB_S+0x58 / +0x5c itself; it kicks only when +0x5c has been frozen > 1200 ms and no
+ * kick came from anywhere for > 900 ms (REC: the deferred in-readout kick, ~every 450 ms, keeps it
+ * silent), or frozen > 600 ms / no kick > 500 ms while the shell idles outside a take. */
+static volatile unsigned wb_wd_stop = 0, wb_wd_done = 1, wb_wd_on = 0, wb_wd_kicks = 0;
+static volatile unsigned wb_wd_force = 0;                 // v183c: keep M10WB kicking while 0x865c != 1 (AF dip)
+static void wb_kick_now(void)                             // v183c: immediate WBIntegTask kick (before the AF dip)
+{
+    unsigned flag = *(volatile unsigned *)(WB_S + 0x20), fv = 0;
+    if (!flag) return;
+    ((fn2)0xfc314b44)(flag, (unsigned)&fv);
+    ((fn2)0xfc314c94)(flag, 0x20050);
+    wb_last_kick_ms = get_tick_count();
+    wb_wd_kicks++;
+}
+static void wb_wd_task(void)
+{
+    unsigned l58 = 0, l5c = 0, t5c = 0, t58 = 0;
+    while (!wb_wd_stop) {
+        unsigned now = get_tick_count();
+        if (*(volatile unsigned *)0x865c == 1 || wb_wd_force) {   // v183c: + forced across the AF dip
+            unsigned v58 = *(volatile unsigned *)(WB_S + 0x58), v5c = *(volatile unsigned *)(WB_S + 0x5c);
+            unsigned flag = *(volatile unsigned *)(WB_S + 0x20);
+            int rec = !sh_on || sh_rec_on;
+            unsigned lim = rec ? 1200 : 600, gap = rec ? 900 : 500;
+            if (v58 != l58 || !t58) { l58 = v58; t58 = now; }
+            if (v5c != l5c || !t5c) { l5c = v5c; t5c = now; }
+            if (flag && (now - t5c > lim || now - t58 > lim) && now - wb_last_kick_ms > gap) {
+                unsigned fv = 0;
+                ((fn2)0xfc314b44)(flag, (unsigned)&fv);
+                ((fn2)0xfc314c94)(flag, 0x20050);
+                wb_last_kick_ms = now;
+                wb_wd_kicks++;
+            }
+        } else { t5c = 0; t58 = 0; }
+        msleep(100);
+    }
+    wb_wd_done = 1;
+    ExitTask();
+}
+static void wb_wd_start(void)
+{
+    if (wb_wd_on) return;
+    wb_wd_stop = 0; wb_wd_done = 0; wb_wd_on = 1;
+    CreateTask("M10WB", 0x18, 0x800, wb_wd_task);
+}
+static void wb_wd_end(void)
+{
+    unsigned t = get_tick_count();
+    if (!wb_wd_on) return;
+    wb_wd_stop = 1;
+    while (!wb_wd_done && get_tick_count() - t < 1000) msleep(20);
+    if (wb_wd_done) wb_wd_on = 0;   // else stays "on": _module_can_unload refuses (task code still in use)
+}
 // v89q: TG freeze after a head error (r101f/g): ImgSens restarts the imager while the TG is still
 // streaming (state 3); TgCtrl stop 0xfc230a74 then leaves [0xe664] = -1 instead of 1, TgCtrl start
 // (0xfc230a36: 1 -> 2, 0xfc230b1a: 2 -> 3) refuses, no TG callback 0x40000 in 300 ms -> 0x100000.
@@ -2235,11 +2429,13 @@ static void wb_mon(unsigned fr)
     // (WBInteg tables still sized for 1190): kick on staleness alone, no limit (each kick = 1 stale WB frame).
     if (!x_zoom && (x_he_n || (shamem(0xc0f06804) >> 16) != 0x4a6) && (wb_kick_n < 32 || (shamem(0xc0f06804) >> 16) != 0x4a6) && now - wb_tick[3] > 400) {
         unsigned fv = 0;
+        if (x_m1 && wb_defer) { wb_due = 1; goto wb_log; }   // v180f: m1 REC: kick later, right after CH12 start (inside the readout, not before the arm window)
         ((fn2)0xfc314b44)(*(volatile unsigned *)(WB_S + 0x20), (unsigned)&fv);
         ((fn2)0xfc314c94)(*(volatile unsigned *)(WB_S + 0x20), 0x20050);   // j_SetEventFlag (ARM thunk)
         if (wb_kick_n < 8) slog("v89j wb kick fr=%d flag=%x", fr, fv);
-        wb_kick_n++; wb_tick[3] = now; wb_tick[2] = now;
+        wb_kick_n++; wb_tick[3] = now; wb_tick[2] = now; wb_last_kick_ms = now;
     }
+wb_log:
     if (wb_logged < 6 && i && (now - wb_tick[1] > 700 || now - wb_tick[2] > 700 || now - wb_tick[3] > 700)) {
         unsigned fv = 0;
         ((fn2)0xfc314b44)(*(volatile unsigned *)(WB_S + 0x20), (unsigned)&fv);   // j_GetEventFlagValue (ARM thunk: even address)
@@ -2247,7 +2443,7 @@ static void wb_mon(unsigned fr)
         slog("  v89i age 54=%d 58=%d", now - wb_tick[1], now - wb_tick[2]);
         slog("  v89i age 5c=%d 50=%d", now - wb_tick[3], now - wb_tick[0]);
         wb_logged++;
-        for (i = 1; i < 4; i++) wb_tick[i] = now;   // re-arm (log again only if still stale)
+        for (i = 1; i < 4; i++) if (i != 3 || !wb_due) wb_tick[i] = now;   // re-arm (log again only if still stale); v182: never while a kick is due (+0x5c age drives it)
     }
 }   // 0: before the error, 1: right after, 2: 2nd good frame after
 // v89b: EDMAC activity sampled for 120 ms, ONLY on channels already read without
@@ -2451,6 +2647,7 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
     int ok = 1;
     if (cap_k < CAP_N) { capl[cap_k][0] = usec() | 0x80000000u; cap_path = 4; cap_miss0 = x_dfe_miss; }   // v154
     STG(0);
+    if (x_trg && !x_trg_done && x_trg[0] == 0x31475254 && x_trg[1] + x_trg[2] <= 120 && !px_on) trg_run(x_trg + 3, x_trg[1]);   // v179: pre-list before the 8830 sync (PACK32 still closed)
     if (px_on) {                        // v73: persistent pipeline still open from the last pass
         int d = x_dfe_ts ? sdiff(x_dfe_ts, usec()) : -1;
         if (d >= 0 && d < (int)x_hi) { reuse = 1; x_chained++; sync_late_us = d; }
@@ -2458,7 +2655,7 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
     }
     if (reuse) cap_path = 1;
     else if (!ch12_idle()) return -1;
-    else if (((x_xo & 2) || x_px) && x_prev_ok && x_dfe_ts && sdiff(x_dfe_ts, usec()) >= 0 && sdiff(x_dfe_ts, usec()) < (int)x_hi) {
+    else if (((x_xo & 2) || x_px) && x_prev_ok && x_dfe_ts && sdiff(x_dfe_ts, usec()) >= (x_m1 ? (int)x_lo : 0) && sdiff(x_dfe_ts, usec()) < (int)x_hi) {
         x_chained++;                    // v72: same 8830 window as our restore (v73: also after a periodic px release)
         sync_late_us = udiff(x_dfe_ts, usec()); cap_path = 2;
     } else if (lvn_sync == 4 && (x_xo & 1)) {
@@ -2536,7 +2733,7 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
     if (lvm_nodma) { msleep(lvm_hold_ms); *dt = 0; st = 0; } else
     {   // ch12_run with a pointer trace (1 sample per ~1 ms, busy loop)
         unsigned u0 = usec(), lastp = 0xffffffff, tmove = get_tick_count(), nt = 0, ulast = u0;
-        unsigned sb = sio_base(), uacc = 0, utl = 0, uprev = u0, umove = u0;
+        unsigned sb = sio_base(), uacc = 0, utl = 0, uprev = u0, umove = u0, x_live_sio = 0;
         memset(lvn_tr, 0, sizeof(lvn_tr));
         if (stg_k < 16) memset(x_pm[stg_k], 0, sizeof(x_pm[0]));   // v66
         tl_n = 0;
@@ -2549,14 +2746,21 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
         }
         eng_out(CH12_BASE, 1);
         if (cap_k < CAP_N) capl[cap_k][1] = usec() | 0x80000000u;   // v154
+        if (wb_due) wb_kick_due(lj_on ? xr_prod : cap_k);   // v180f (v183: frame index, not pass ring index)
+        if (x_trg && !x_trg_done && x_trg[0] == 0x31475254 && x_trg[1] + x_trg[2] <= 120) {   // v179
+            trg_run(x_trg + 3 + 2 * x_trg[1], x_trg[2]);
+            x_trg_done = 1; x_trg_us = udiff(u0, usec());
+            x_dma_sio = sb ? *(volatile unsigned *)(sb + 0x204) : 0;
+        }
 
         for (;;) {
             unsigned pp, u = usec();
             if (x_diag) wr_poll();
+            if (x_poll) x_poll();   // v181: previous encode ended during this readout -> start the next one now
             if (REG(CH12_BASE) == 0) break;
             pp = REG(CH12_BASE + 8);
-            if (pp != phys && !x_dma_live) { x_dma_live = 1; if (x_early) { tlf_set(x_early_fr, 1, u); if (x_early_fr < TLF_N) tlf[x_early_fr][7] = REG(0xc0f58908); } }   // v119: readout has started (v140: timeline; v141: slot 7 = read ch47 address at line 1)
-            if (lvn_sync == 4 && pp != phys && dfe_seen(x_dma_sio, 500)) {   // v69: frame over, lines lost
+            if (pp != phys && !x_dma_live) { x_dma_live = 1; x_live_sio = sb ? *(volatile unsigned *)(sb + 0x204) : 0; if (x_early) { tlf_set(x_early_fr, 1, u); TLF_ROW(x_early_fr)[7] = REG(0xc0f58908); } }   // v119/v180d: readout has started (m1: record SIO index AFTER this frame's CMOS 0)
+            if (lvn_sync == 4 && pp != phys && dfe_seen(x_m1 ? x_live_sio : x_dma_sio, 500)) {   // v69/v180d: frame over, lines lost
                 if (REG(CH12_BASE) == 0) break;
                 x_abort++; st = 3; break;
             }
@@ -2603,7 +2807,7 @@ static int lvn_cap(char *buf, unsigned phys, unsigned n, unsigned *dt, unsigned 
         }
         *dt = udiff(u0, usec());
         x_dma_live = 0; x_dma_t1 = usec();   // v119
-        if (x_early) { tlf_set(x_early_fr, 2, x_dma_t1); if (x_early_fr < TLF_N) tlf[x_early_fr][0] = REG(0xc0f58908); }   // v140 (v141: slot 0 = ch47 address at DMA end)
+        if (x_early) { tlf_set(x_early_fr, 2, x_dma_t1); TLF_ROW(x_early_fr)[0] = REG(0xc0f58908); }   // v140 (v141: slot 0 = ch47 address at DMA end)
         if (x_early && st == 0) {
             if (x_he_fix && lj_on && *(volatile unsigned *)(0x0000fa68 + 0x1c)) ;   // v172: HEAD_ERR handled in lv_x3 (skip JpCore)
             else { x_ready = x_early_fr + 1; if (x_kick && !lj_chased) x_kick(x_early_fr); if (lj_sem_p) GiveSemaphore(*lj_sem_p); }
@@ -2969,7 +3173,7 @@ static void __attribute__((unused)) lv_watch(void)
 }
 
 // v28: watch after a pass
-#define XW_N 3000
+#define XW_N 64                    // v180e: 3000 -> 64 (-185 KiB BSS : module chargeable depuis un script Lua autonome)
 typedef struct { unsigned tick, us, sio, tg, tgc[4], is[8]; } xw_rec;
 static xw_rec xw[XW_N];
 static unsigned xw_n;
@@ -3018,6 +3222,13 @@ static int xr_fd, xr_sem;
 static char *xr_buf;
 static unsigned xr_chunk = 0x20000, xr_gated = 0, xr_wlen;
 static unsigned xr_fb, xr_nslot, xr_slot[XR_MAX], xr_wus[XR_MAX], xr_tick[XR_MAX];
+static volatile unsigned xr_last_drop_ms = 0;   // v183: last ring-full drop (REC preview backs off 500 ms)
+static unsigned short xr_drop_at[XR_MAX];       // v183: ring drops before captured frame k (6 KiB)
+static unsigned long long xr_vidf_us(unsigned k)   // v183: m1 VIDF timestamp on the 24.00p slot grid
+{
+    if (x_m1 && lj_on && k < XR_MAX) return (unsigned long long)(k + xr_drop_at[k]) * (unsigned long long)(x_per ? x_per : 41666u);
+    return (unsigned long long)(k < XR_MAX ? xr_tick[k] : 0) * 1000ULL;
+}
 // v55: MLV output. Slot layout in EXMEM: [512: VIDF header + frameSpace]
 // [frame][NULL block up to the next 512] -> one aligned write per frame.
 static unsigned xr_mlv = 0, xr_stride, xr_nullsz, xr_t0us, xr_us_acc, xr_us_last;
@@ -3109,8 +3320,13 @@ static void mlv_build_hdr(unsigned w, unsigned h, unsigned bpp, unsigned nframes
     put32(q + 20, pitch * h); put32(q + 24, bpp);
     put32(q + 28, 128u << (bpp - 10)); put32(q + 32, (1u << bpp) - 1);
     put32(q + 36, 0); put32(q + 40, 0); put32(q + 44, w); put32(q + 48, h);       // crop
-    {   // active y1 x1 y2 x2 (v90: Film 3x3 rows 3-27 = optical black -> y1 = 28)
+    {   // active y1 x1 y2 x2 (v90: Film 3x3 rows 3-27 = optical black -> y1 = 28; v180: ImgMode 1 auto OB)
         unsigned y1 = (x_skipy || x_zoom) ? 28 : 4, x1 = 72;   // v159: zoom has 28 optical-black rows too
+        if (x_m1) {
+            unsigned h6800 = shamem(0xc0f06800);
+            y1 = ((h6800 >> 16) >= 32) ? 0 : 26;
+            x1 = ((h6800 & 0xffff) >= 0x30) ? 0 : 72;
+        }
         if (mlv_crop) { unsigned r0 = lj_eoff / lvn_lb, c0 = (lj_eoff % lvn_lb) * 8 / lvn_bpp; y1 = r0 >= y1 ? 0 : y1 - r0; x1 = c0 >= x1 ? 0 : x1 - c0; }   // v159: encoder window
         put32(q + 52, y1); put32(q + 56, x1); put32(q + 60, y1 + (h - y1) / 2 * 2); put32(q + 64, w);
     }
@@ -3121,7 +3337,7 @@ static void mlv_build_hdr(unsigned w, unsigned h, unsigned bpp, unsigned nframes
     p += 180;
     q = mlv_blk(p, "RAWC", 32);
     put16(q, 5184); put16(q + 2, 3456); put16(q + 4, 162); put16(q + 6, 0);
-    q[8] = x_zoom ? 1 : 3; q[9] = 0; q[10] = 1; q[11] = x_skipy;   // v158: 1:1 in the magnifier put16(q + 12, 0x8000); put16(q + 14, 0x8000);
+    q[8] = (x_zoom || x_m1) ? 1 : 3; q[9] = 0; q[10] = 1; q[11] = x_skipy;   // v158/v180: 1:1 in magnifier & ImgMode 1
     p += 32;
     q = mlv_blk(p, "IDNT", 84);
     memcpy(q, "Canon EOS M10", 13); put32(q + 32, 0x80000355);
@@ -3140,7 +3356,18 @@ static void mlv_frame_hdr(unsigned char *p, unsigned k, unsigned fb, unsigned ts
 
 static unsigned xr_fbytes, xr_fileno, xr_fcount[16], xr_chunk_start = 0;
 static char xr_base[16] = "A/M10X3";   // v160: take base name (A/M10_0001 in shell mode)
+static unsigned xr_roll_ms = 0, xr_roll_n = 0, xr_roll_fr = 0, xr_roll_drops = 0;   // v182: chunk switch cost (max ms), count, frame, ring drops at the 1st roll
+static void xr_roll_close(void);
 static void xr_roll(void)                   // v57: FAT32: < 4 GiB per file, ML-style chunks
+{
+    unsigned t0 = get_tick_count(), dt;
+    if (!xr_roll_n) { xr_roll_fr = xr_wr; xr_roll_drops = x_dr[0]; }
+    xr_roll_close();
+    dt = get_tick_count() - t0;
+    if (dt > xr_roll_ms) xr_roll_ms = dt;
+    xr_roll_n++;
+}
+static void xr_roll_close(void)
 {
     char nm[24];
     close(xr_fd);
@@ -3178,13 +3405,13 @@ static void mlv_finalize(unsigned w, unsigned h, unsigned bpp, int lj_class)   /
     put16(mlv_hdr + 26, nfiles);
     for (c = 0; c < nfiles; c++) {
         char nm[24];
-        FILE *f;
+        int f;
         if (c == 0) sprintf(nm, "%s.MLV", xr_base);
         else sprintf(nm, "%s.M%02u", xr_base, c - 1);
         put16(mlv_hdr + 24, c);
         put32(mlv_hdr + 36, xr_fcount[c]);
-        f = fopen(nm, "r+b");
-        if (f) { fseek(f, 0, SEEK_SET); fwrite(mlv_hdr, 1, 512, f); fclose(f); }
+        f = open(nm, O_RDWR, 0777);   // v182: no stdio (no FILE / buffer allocation from the CHDK heap)
+        if (f >= 0) { lseek(f, 0, SEEK_SET); write(f, mlv_hdr, 512); close(f); }
     }
 }
 // v101: compressed REC. Raw ring: xr_nslot slots of xr_fb bytes from buf (captured by lvn_cap).
@@ -3253,7 +3480,7 @@ static void lj_vidf(unsigned k, unsigned sz)   // v127: VIDF header + NULL paddi
     unsigned char *h = lj_buf + lj_cbase + cs * lj_cslot_sz;
     unsigned tot = (512 + sz + 16 + 511) & ~511u, nul = tot - 512 - sz;
     memset(h, 0, 512);
-    memcpy(h, "VIDF", 4); put32(h + 4, 512 + sz); put32(h + 8, (xr_tick[k]) * 1000); put32(h + 16, k); put32(h + 28, 480);
+    memcpy(h, "VIDF", 4); put32(h + 4, 512 + sz); put32(h + 8, (unsigned)xr_vidf_us(k)); put32(h + 12, (unsigned)(xr_vidf_us(k) >> 32)); put32(h + 16, k); put32(h + 28, 480);
     h += 512 + sz; memcpy(h, "NULL", 4); put32(h + 4, nul); put32(h + 8, 0); put32(h + 12, 0);
     if (k < XR_MAX) xr_wus[k] = tot;
     lj_prev_sz = sz;
@@ -3331,6 +3558,17 @@ static void lj_kick(unsigned fr)
     if (enc_begin((char *)lj_buf, lj_phys, 0)) { lj_kicked = fr + 1; lj_k_ok++; tlf_set(fr, 3, enc_u0); } else lj_k_no[3]++;   // v140
     uk = udiff(uk, usec()); if (uk > lj_k_max) lj_k_max = uk; }
 }
+static unsigned lj_async_n = 0;
+static void lj_poll(void)   // v181: capture task only (sole collector): collect a finished encode, kick the oldest ready frame
+{
+    if (lj_err || xr_err || !x_kick) return;
+    if (lj_kicked) { if (!cb_done) return; if (lj_collect() < 0) return; }
+    if (!lj_kicked && lj_cnt < x_ready && lj_dup_t >= lj_dup_h) {
+        unsigned ok0 = lj_k_ok, kw = lj_kwait;
+        lj_kwait = 0; lj_kick(0); lj_kwait = kw;
+        if (lj_k_ok != ok0) lj_async_n++;
+    }
+}
 static void lj_task(void)
 {
     for (;;) {
@@ -3394,7 +3632,7 @@ static void lj_task(void)
                 unsigned char *h = lj_buf + lj_cbase + cs * lj_cslot_sz;
                 unsigned tot = (512 + sz + 16 + 511) & ~511u, nul = tot - 512 - sz;
                 memset(h, 0, 512);
-                memcpy(h, "VIDF", 4); put32(h + 4, 512 + sz); put32(h + 8, (xr_tick[k]) * 1000); put32(h + 16, k); put32(h + 28, 480);
+                memcpy(h, "VIDF", 4); put32(h + 4, 512 + sz); put32(h + 8, (unsigned)xr_vidf_us(k)); put32(h + 12, (unsigned)(xr_vidf_us(k) >> 32)); put32(h + 16, k); put32(h + 28, 480);
                 if (lj_ns > 1) { memcpy(h + 32, "M10S", 4); put32(h + 36, lj_ns); for (j = 0; j < lj_ns; j++) put32(h + 40 + 4 * j, ssz[j]); }
                 h += 512 + sz; memcpy(h, "NULL", 4); put32(h + 4, nul); put32(h + 8, 0); put32(h + 12, 0);
                 if (k < XR_MAX) xr_wus[k] = tot;
@@ -3426,7 +3664,7 @@ static void xr_task(void)
             }
             // v173: writer alone mutates a shared VIDF header; xr_wr remains
             // unchanged until every byte is written, protecting its physical slot.
-            if (x_he_fix) { put32((unsigned char *)p + 8, xr_tick[k] * 1000); put32((unsigned char *)p + 16, k); }
+            if (x_he_fix) { put32((unsigned char *)p + 8, (unsigned)xr_vidf_us(k)); put32((unsigned char *)p + 12, (unsigned)(xr_vidf_us(k) >> 32)); put32((unsigned char *)p + 16, k); }
             tlf_set(k, 5, t0);   // v140
             if (!len) xr_err = 1;
             else if (!lj_swhi) { if (write(xr_fd, p, len) != (int)len) xr_err = 1; }
@@ -3557,27 +3795,57 @@ typedef struct {
     unsigned char fps;
     unsigned char bpp;
     unsigned char rsel;
-    unsigned char pad;
+    unsigned char kind;            // v182: 0 = x5 magnifier, 1 = Film 1x3 (armed from PLAY, line 640), 2 = ImgMode 1 1440p
     unsigned short fl;
     unsigned short per;
     unsigned short c0;
     unsigned short w;
     const char *tag;
+    unsigned short h;              // v185: ImgMode 1 frame lines (head = h + 16)
+    unsigned short lclk;           // v185: ImgMode 1 TG line clock
+    unsigned char m1_wide;         // v185: 1 = wide ImgMode 1 window (X0 0x30, CMOS 2/5/7 wide)
 } sh_prof_t;
+#define SH_X5 0
+#define SH_X3 1
+#define SH_M1 2
 static const sh_prof_t sh_profs[] = {
-    { 24, 14, 0x10, 0, 1819, 41666, 304, 2048, "24p 2K 14b"   },   // 1.90:1 2K DCI 14-bit (0x10 HEAD, 1.00x unity)
-    { 24, 14, 0x10, 0, 1819, 41666, 368, 1920, "24p 1920 14b" },   // 1.78:1 16:9 14-bit (0x10 HEAD)
-    { 25, 14, 0x10, 0, 1747, 40017, 368, 1920, "25p 1920 14b" },   // 1.78:1 25p 14-bit (0x10 HEAD)
-    { 24, 10, 0x00, 0, 1819, 41666, 192, 2304, "24p 2304 10b" },   // 2.14:1 cinema 10-bit
-    { 24, 10, 0x00, 0, 1819, 41666,  80, 2512, "24p 2512 10b" },   // 2.33:1 max active 10-bit
-    { 24, 10, 0x00, 0, 1819, 41666, 304, 2048, "24p 2048 10b" },
-    { 24, 10, 0x00, 0, 1819, 41666, 368, 1920, "24p 1920 10b" },
-    { 25, 10, 0x00, 0, 1747, 40017, 192, 2304, "25p 2304 10b" },   // 25.00p PAL legacy 10-bit
+    { 24, 10, 0x10, SH_M1, 1819, 41666, 0, 1920, "1440p 24p 10b", 1440, 732, 0 },   // v182: ImgMode 1 1920x1440 1:1 (r159), default
+    { 24, 12, 0x10, SH_M1, 1819, 41666, 0, 1920, "1440p 24p 12b", 1440, 732, 0 },   // v182: same, 12-bit (~22 fps encoder)
+    { 24, 10, 0x10, SH_M1, 2080, 41665, 0, 1728, "Wide 1800 10b", 1800, 640, 1 },   // v185: wide ImgMode 1 1728x1800
+    { 24, 12, 0x10, SH_M1, 1819, 41666, 0, 1728, "Wide 1440 12b", 1440, 732, 1 },   // v185: wide ImgMode 1 1728x1440 12-bit
+    { 24, 10, 0x10, SH_M1, 1819, 41666, 0, 1728, "Wide 1440 10b", 1440, 732, 1 },   // v185: wide ImgMode 1 1728x1440 10-bit
+    { 25, 12, 0x22, SH_X3, 2000, 40000, 136, 1536, "1x3 25p 12b", 0, 0, 0 },   // v178: Film 1x3 full APS-C width, 12-bit PREFIFO, line 640 (r147/r149)
+    { 24, 14, 0x10, 0, 1819, 41666, 304, 2048, "24p 2K 14b", 0, 0, 0 },   // 1.90:1 2K DCI 14-bit (0x10 HEAD, 1.00x unity)
+    { 24, 14, 0x10, 0, 1819, 41666, 368, 1920, "24p 1920 14b", 0, 0, 0 },   // 1.78:1 16:9 14-bit (0x10 HEAD)
+    { 25, 14, 0x10, 0, 1747, 40017, 368, 1920, "25p 1920 14b", 0, 0, 0 },   // 1.78:1 25p 14-bit (0x10 HEAD)
+    { 24, 10, 0x00, 0, 1819, 41666, 192, 2304, "24p 2304 10b", 0, 0, 0 },   // 2.14:1 cinema 10-bit
+    { 24, 10, 0x00, 0, 1819, 41666,  80, 2512, "24p 2512 10b", 0, 0, 0 },   // 2.33:1 max active 10-bit
+    { 24, 10, 0x00, 0, 1819, 41666, 304, 2048, "24p 2048 10b", 0, 0, 0 },
+    { 24, 10, 0x00, 0, 1819, 41666, 368, 1920, "24p 1920 10b", 0, 0, 0 },
+    { 25, 10, 0x00, 0, 1747, 40017, 192, 2304, "25p 2304 10b", 0, 0, 0 },   // 25.00p PAL legacy 10-bit
 };
 #define SH_NPROF (sizeof(sh_profs) / sizeof(sh_profs[0]))
 static volatile unsigned sh_prof_idx = 0, sh_armed_fps = 0;
+static volatile unsigned sh_x3_ok = 0;   // v178: Film 1x3 armed and running
 static volatile unsigned pv_zebra = 1, pv_clip_pct = 0;
+static volatile unsigned pv_peak = 1;   // v183: focus peaking (standby full-res preview only), default ON
+static volatile unsigned pv_mode = 0;    // v182 (ImgMode 1): 0 = 4:3 whole frame, 1 = 1:1 focus (centre 536x400), 2 = OFF (black)
+static volatile unsigned sh_m1_ok = 0;   // v182: ImgMode 1 armed by the shell and running
 static const sh_prof_t *sh_prof(void) { return &sh_profs[sh_prof_idx < SH_NPROF ? sh_prof_idx : 0]; }
+static int sh_is_m1(void) { return sh_on && sh_prof()->kind == SH_M1; }
+// v185: ImgMode 1 geometry of the current profile (defaults = v182 1920x1440)
+static unsigned sh_m1_w(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->w ? p->w : 1920; }
+static unsigned sh_m1_h(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->h ? p->h : 1440; }
+static unsigned sh_m1_head_h(void) { return sh_m1_h() + 16; }
+static unsigned sh_m1_x0(void) { return (sh_prof()->kind == SH_M1 && sh_prof()->m1_wide) ? 0x30u : 0x34u; }
+static unsigned sh_m1_lclk(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->lclk ? p->lclk : 732; }
+static unsigned sh_m1_fl(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->fl ? p->fl : 1819; }
+static unsigned sh_m1_per(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->per ? p->per : 41666; }
+static unsigned sh_m1_fc3c(void) { return (7058u - 2u * sh_m1_head_h()) / 2u; }
+static unsigned sh_m1_wide(void) { return sh_on && sh_prof()->kind == SH_M1 && sh_prof()->m1_wide; }
+static unsigned sh_m1_geom(const sh_prof_t *p) { return ((unsigned)p->w << 16) | ((unsigned)p->h << 2) | (unsigned)p->m1_wide; }
+static volatile unsigned sh_m1_armed_geom = 0;   // v185: sh_m1_geom() of the profile ImgMode 1 was last armed with
+static int m1_ready(void) { return *(volatile unsigned *)0x865c == 1 && *(volatile unsigned *)0xe664 == 3; }
 static void sh_say(const char *s1, const char *s2);
 static void sh_redraw(int force);
 static int sh_arm_fps(const sh_prof_t *pr, int update_cache);
@@ -3586,10 +3854,44 @@ static void sh_hud(int force);
 static void sh_hud_clear(void);
 
 static unsigned pv_stat[3];                   // last frame: frames, black, mean luma (raw units)
+static volatile unsigned pv_has_img = 0;      // v184a: a preview image is on the LCD (REC -> Standby keeps it, no black flash)
+#if defined(__GNUC__) && !defined(__clang__)
+#define PV_HOT __attribute__((optimize("O2","schedule-insns2")))   // v184b: O2 again, built with -mword-relocations (no MOVW/MOVT reloc 47)
+static inline __attribute__((always_inline)) unsigned pv_get10(const volatile unsigned short *p, unsigned c);
+#else
+#define PV_HOT
+#endif
 static inline unsigned pv_get10(const volatile unsigned short *p, unsigned c)
 {
     unsigned b = c * 10, w = b >> 4, v = ((unsigned)p[w] << 16) | p[w + 1];
     return (v >> (22 - (b & 15))) & 0x3ff;
+}
+/* v184a / v184b: fixed REC-view LUTs for ImgMode 1 (black 127, span 896, daylight WB R x1.75 / B x1.5 folded in):
+ * 10b -> 8b sqrt + subtle cinema S-curve, pre-shifted to their ARGB lane (v184b: px = lr[R] | lg[G] | lb[B]). */
+#define PV_BLACK 0xFF000000u
+static unsigned pv_lut_r[1024], pv_lut_g[1024], pv_lut_b[1024];   // v184b: u32, R = PV_BLACK | r8 << 16, G = g8 << 8, B = b8
+static unsigned pv_m1_lut_ok = 0;
+static unsigned pv_sqrt_m1(unsigned v)
+{
+    unsigned x = v > 127 ? (v - 127) * 65535 / 896 : 0, r = 0, bit;
+    int s;
+    if (x > 65535) x = 65535;
+    for (bit = 1u << 7; bit; bit >>= 1) if ((r | bit) * (r | bit) <= x) r |= bit;   // r = sqrt(x), 0..255
+    s = (int)r + ((int)r - 128) * (int)r * (255 - (int)r) / 49152;   // v184b: S-curve, 0 / 128 / 255 fixed, slope 0.34..1.33 (monotone)
+    return s < 0 ? 0 : s > 255 ? 255 : (unsigned)s;
+}
+static void pv_build_m1_luts(void)
+{
+    unsigned v;
+    for (v = 0; v < 1024; v++) {
+        unsigned d = v > 127 ? v - 127 : 0, rr = 127 + ((d * 28) >> 4), bb = 127 + ((d * 24) >> 4);
+        if (rr > 1023) rr = 1023;
+        if (bb > 1023) bb = 1023;
+        pv_lut_r[v] = PV_BLACK | (pv_sqrt_m1(rr) << 16);   // v184b: pre-shifted ARGB lanes (zero per-pixel cost)
+        pv_lut_g[v] = pv_sqrt_m1(v) << 8;
+        pv_lut_b[v] = pv_sqrt_m1(bb);
+    }
+    pv_m1_lut_ok = 1;
 }
 static void pv_make_lut(unsigned black, unsigned mean)
 {
@@ -3601,16 +3903,400 @@ static void pv_make_lut(unsigned black, unsigned mean)
         for (bit = 1u << 7; bit; bit >>= 1) if ((r | bit) * (r | bit) <= x) r |= bit;   // r = sqrt(x), 0..255
         pv_lut[v] = r;
     }
+    if (black == 127 && !pv_m1_lut_ok) pv_build_m1_luts();   // v184a: ImgMode 1 fixed view
+}
+// v182 (B.3): PV_RGBA / PV_BW = 360 are only valid on the LCD (HDMI: bm_w = 480): no direct overlay write otherwise
+static int pv_ok(void) { return camera_screen.buffer_width == PV_BW; }
+static void pv_fill(unsigned y0, unsigned y1, unsigned x0, unsigned x1, unsigned v)
+{
+    unsigned x, y;
+    for (y = y0; y < y1; y++) { unsigned *o = PV_RGBA + y * PV_BW; for (x = x0; x < x1; x++) o[x] = v; }
 }
 static void pv_clear(void)
 {
     unsigned y;
+    if (!pv_ok()) return;
     for (y = PV_Y - 1; y < PV_Y + PV_H + 1; y++) memset(PV_RGBA + y * PV_BW + PV_X - 1, 0, (PV_W + 2) * 4);
     vid_bitmap_refresh();
+}
+/* v182 (B.2/B.3): in ImgMode 1 Canon's YUV view shows magenta / green / cyan bars through every transparent
+ * overlay pixel. Rows 20..219 are made opaque black outside the 268 x 200 image window (x 46..313), or
+ * entirely (full = 1, view OFF, no image yet); the HUD bars (rows 0..19, 220..239) are drawn opaque by sh_hud. */
+#define PV_M1_X 46
+#define PV_M1_W 268
+#define PV_M1_H 200
+static void pv_mask_opaque(int full)
+{
+    if (!pv_ok()) return;
+    if (full || pv_mode == 2) pv_fill(20, 220, 0, PV_BW, PV_BLACK);
+    else { pv_fill(20, 220, 0, PV_M1_X, PV_BLACK); pv_fill(20, 220, PV_M1_X + PV_M1_W, PV_BW, PV_BLACK); }
+    vid_bitmap_refresh();
+}
+static void pv_mask_clear(void)   // leaving ImgMode 1: Canon's own view (x5 / Film) visible again
+{
+    pv_has_img = 0;
+    if (!pv_ok()) return;
+    memset(PV_RGBA + 20 * PV_BW, 0, 200 * PV_BW * 4);
+    vid_bitmap_refresh();
+}
+#if defined(__GNUC__) && !defined(__clang__)
+static inline __attribute__((always_inline)) unsigned pv_get12(const volatile unsigned short *p, unsigned c);
+#endif
+static inline unsigned pv_get12(const volatile unsigned short *p, unsigned c)   // v182 (B.4): b&15 in {0,12,8,4}
+{
+    unsigned b = c * 12, w = b >> 4, v = ((unsigned)p[w] << 16) | p[w + 1];
+    return (v >> (20 - (b & 15))) & 0xfff;
+}
+/* v182 (B.4) / v184a / v184b: ImgMode 1 colour preview. Frame 1920 x 1440 PACK32 (10 or 12 bit), RGGB from (0,0)
+ * (X0 = 0x34, Y0 = 32, both even), no optical black in the window: fixed black 127 (10b scale; 12b samples >> 2).
+ * pv_mode 0: whole frame 4:3 -> 268 x 200 (one quad per pixel); 1: centre 536 x 400 at one photosite per LCD dot.
+ * half_res (REC): 134 x 100 quads, each written as a 2 x 2 block. v184b: per-column word / shift tables, one inner
+ * loop per bit depth (no bpp test per pixel), px = lr[R] | lg[G] | lb[B] (pre-shifted u32 LUTs, no saturation pass),
+ * output-grid peaking (left + upper output pixel) and zebra unchanged. No refresh here. */
+static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
+{
+    const unsigned mode = pv_mode, zebra = pv_zebra, peak = pv_peak, fidx = pv_stat[0];   // v184a: hoisted (volatile globals)
+    const unsigned black = 127, focus = (mode == 1), st = half_res ? 2 : 1;
+    const unsigned W = PV_M1_W / st, H = PV_M1_H / st, lb = 1920 * bpp / 8;
+    const int do_peak = peak && !half_res, b12 = (bpp == 12);
+    const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;   // v184b: hoisted LUT bases
+    unsigned x, y, sum = 0, n = 0, clip = 0;
+    static unsigned short pk_prev[PV_M1_W];   // v183: previous output row green (10b scale)
+    static unsigned short col_w[PV_M1_W];      // v184b: first 16-bit word of quad column c (b = c * bpp, b >> 4)
+    static unsigned char col_sh[PV_M1_W];      // v184b: right shift of sample c inside its 32-bit window
+    static unsigned row_px[PV_M1_W];           // v183d: cached row, burst-copied to uncached PV_RGBA (never reentrant)
+    if (!pv_ok() || mode == 2) return;
+    if (!pv_m1_lut_ok) pv_build_m1_luts();
+    for (x = 0; x < W; x++) {
+        unsigned c = focus ? 692 + 2 * st * x : (x * 1920 / W) & ~1u, b = c * bpp;
+        col_w[x] = (unsigned short)(b >> 4);
+        col_sh[x] = (unsigned char)((b12 ? 20 : 22) - (b & 15));   // c even: b & 15 in {0,4,8,12} (10b) / {0,8} (12b)
+    }
+    /* v184b: one row of quads at bit depth D (mask M, 12b -> 10b scale >> SC, zebra / clip threshold THR on raw samples) */
+#define M1_ROW(D, M, SC, THR) \
+    for (x = 0; x < W; x++) { \
+        const unsigned w = col_w[x], sh = col_sh[x]; \
+        const unsigned v0 = ((unsigned)p0[w] << 16) | p0[w + 1], v1 = ((unsigned)p1[w] << 16) | p1[w + 1]; \
+        unsigned s0 = (v0 >> sh) & (M), s1 = (v0 >> (sh - (D))) & (M), s2 = (v1 >> sh) & (M), s3 = (v1 >> (sh - (D))) & (M); \
+        unsigned mx = s0 > s1 ? s0 : s1, m2 = s2 > s3 ? s2 : s3, px, g; \
+        mx = mx > m2 ? mx : m2; \
+        s0 >>= (SC); s1 >>= (SC); s2 >>= (SC); s3 >>= (SC); \
+        g = (s1 + s2) >> 1; \
+        if (mx >= (THR)) clip++; \
+        if (zebra && mx >= (THR) && (((st * (x + y) + fidx) & 7) < 4)) px = 0xFFFF2800u; \
+        else { \
+            px = lr[s0] | lg[g] | lb_t[s3]; \
+            if (!(x & 3)) { sum += g; n++; } \
+            if (do_peak && mx < (THR) && y > 0 && x > 0) { \
+                unsigned dg_h = g > g_left ? g - g_left : g_left - g; \
+                unsigned dg_v = g > pk_prev[x] ? g - pk_prev[x] : pk_prev[x] - g; \
+                if ((dg_h + dg_v) * 6 > g + g_left + 2 * black + 32) px = 0xFF00FF40u; \
+            } \
+        } \
+        if (do_peak) { pk_prev[x] = (unsigned short)g; g_left = g; } \
+        if (st == 2) { row_px[2 * x] = px; row_px[2 * x + 1] = px; } \
+        else row_px[x] = px; \
+    }
+    for (y = 0; y < H; y++) {
+        unsigned g_left = 0;
+        unsigned r = focus ? 520 + 2 * st * y : (y * 1440 / H) & ~1u;
+        const unsigned short *p0 = (const unsigned short *)(frame + r * lb);         // v183b: not volatile (cached frame)
+        const unsigned short *p1 = (const unsigned short *)(frame + (r + 1) * lb);
+        unsigned *o = PV_RGBA + (20 + st * y) * PV_BW + PV_M1_X;
+        if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }   // v184b: bit depth chosen per row, never per pixel
+        else if (st == 1) {
+            /* v184c: 10-bit full-res rows, split fast / peak so neither carries the other's state (v184b: 5-7
+             * spills / px). lb = 2400 -> row r + 1 = p0 + 1200 halfwords (one base register); clip = any sample
+             * >= 1020 <=> bit 10 of (s + 4); n += ceil(W / 4) per row, minus the zebra-replaced x % 4 == 0 pixels. */
+            const unsigned zp = y + fidx;
+            n += (W + 3) >> 2;
+            if (!do_peak) {
+                for (x = 0; x < W; x++) {
+                    const unsigned short *q = p0 + col_w[x];
+                    const unsigned sh = col_sh[x];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[1200] << 16) | q[1201];
+                    const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
+                    const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
+                    const unsigned g = (s1 + s2) >> 1;
+                    if (__builtin_expect((((s0 + 4) | (s1 + 4) | (s2 + 4) | (s3 + 4)) & 0x400u) != 0, 0)) {
+                        clip++;
+                        if (zebra && ((x + zp) & 7) < 4) { row_px[x] = 0xFFFF2800u; if (!(x & 3)) n--; continue; }
+                    }
+                    row_px[x] = lr[s0] | lg[g] | lb_t[s3];
+                    if (!(x & 3)) sum += g;
+                }
+            } else {
+                for (x = 0; x < W; x++) {
+                    const unsigned short *q = p0 + col_w[x];
+                    const unsigned sh = col_sh[x];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[1200] << 16) | q[1201];
+                    const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
+                    const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
+                    const unsigned g = (s1 + s2) >> 1, gp = pk_prev[x], gl = g_left;
+                    const unsigned clp = ((s0 + 4) | (s1 + 4) | (s2 + 4) | (s3 + 4)) & 0x400u;
+                    unsigned px;
+                    pk_prev[x] = (unsigned short)g; g_left = g;
+                    if (__builtin_expect(clp != 0, 0)) {
+                        clip++;
+                        if (zebra && ((x + zp) & 7) < 4) { row_px[x] = 0xFFFF2800u; if (!(x & 3)) n--; continue; }
+                    }
+                    px = lr[s0] | lg[g] | lb_t[s3];
+                    if (!(x & 3)) sum += g;
+                    if (!clp && x && y) {
+                        const unsigned dh = g > gl ? g - gl : gl - g, dv = g > gp ? g - gp : gp - g;
+                        if ((dh + dv) * 6 > g + gl + 2 * black + 32) px = 0xFF00FF40u;
+                    }
+                    row_px[x] = px;
+                }
+            }
+        }
+        else { M1_ROW(10, 0x3ffu, 0, 1020u) }
+        if (st == 2) { memcpy(o, row_px, PV_M1_W * 4); memcpy(o + PV_BW, row_px, PV_M1_W * 4); }   // v183d: burst writes
+        else memcpy(o, row_px, W * 4);
+    }
+#undef M1_ROW
+    pv_clip_pct = clip ? ((clip * 100 + W * H - 1) / (W * H)) : 0;
+    pv_stat[0]++; pv_stat[1] = black;
+    if (n) { unsigned cur = sum / n; pv_stat[2] = pv_stat[0] > 1 ? (pv_stat[2] * 3 + cur) >> 2 : cur; }   // v183b: EMA
+    // v184a: no pv_make_lut() here (fixed REC view)
+}
+#define FN_DFLUSH   0xfc1267af   // v183b: dcache_flush_range(addr, len) = DCIMVAC loop + dsb sy (ROM 1.10d)
+/* v184a: flush only the row pairs (r, r + 1) pv_render_m1 samples for (mode, half_res), 32-byte aligned. */
+static void pv_dflush_m1(unsigned phys, unsigned lb, unsigned mode, int half_res)
+{
+    const unsigned st = half_res ? 2 : 1, H = PV_M1_H / st, bpp = lb / 240;
+    unsigned y;
+    if (mode == 2 || !bpp) return;
+    if (mode == 1) {   // 1:1: cols 692 .. 1227 of rows 520 .. 919
+        unsigned x0 = (692 * bpp / 8) & ~31u, x1 = (1228 * bpp / 8 + 4 + 31) & ~31u;
+        if (x1 > lb) x1 = lb;
+        for (y = 0; y < H; y++) {
+            unsigned a = phys + (520 + 2 * st * y) * lb, s;
+            s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
+            a += lb;
+            s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
+        }
+    } else {           // 4:3: whole row pairs
+        for (y = 0; y < H; y++) {
+            unsigned r = (y * 1440 / H) & ~1u, s = (phys + r * lb) & ~31u, e = (phys + (r + 2) * lb + 31) & ~31u;
+            ((fn2)FN_DFLUSH)(s, e - s);
+        }
+    }
+}
+/* v185: Wide 1:3 ImgMode 1 (raw_w x raw_h PACK32, e.g. 1728 x 1440, horizontally squeezed 3x) preview. Dedicated
+ * mask / renderer / dflush (the 1920 x 1440 4:3 path above is untouched), selected by the pv_m1_* dispatchers.
+ * pv_mode 0: whole frame -> 360 x 100 (124 if raw_h > 1440) letterbox centred in rows 20..219, 2.39:1 ticks;
+ * 1: centre 240 x 400 photosites -> 360 x 200 (desqueezed); 2: OFF. */
+static void pv_mask_opaque_wide(int full, unsigned raw_h)
+{
+    if (!pv_ok()) return;
+    if (full || pv_mode == 2) pv_fill(20, 220, 0, PV_BW, PV_BLACK);
+    else if (pv_mode != 1) {
+        unsigned oh = raw_h > 1440 ? 124 : 100, oy = 20 + (200 - oh) / 2;
+        pv_fill(20, oy, 0, PV_BW, PV_BLACK);
+        pv_fill(oy + oh, 220, 0, PV_BW, PV_BLACK);
+    }
+    vid_bitmap_refresh();
+}
+static PV_HOT void pv_render_m1_wide(const char *frame, unsigned bpp, int half_res, unsigned raw_w, unsigned raw_h)
+{
+    const unsigned mode = pv_mode, zebra = pv_zebra, peak = pv_peak, fidx = pv_stat[0];   // hoisted (volatile globals)
+    const unsigned black = 127, focus = (mode == 1), st = half_res ? 2 : 1;
+    const unsigned out_w = PV_BW, out_h = focus ? 200 : (raw_h > 1440 ? 124 : 100), out_y = focus ? 20 : (20 + (200 - out_h) / 2);
+    const unsigned W = out_w / st, H = out_h / st, lb = raw_w * bpp / 8, lb_hw = lb >> 1;
+    const int do_peak = peak && !half_res, b12 = (bpp == 12);
+    const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;
+    const unsigned w239 = out_h * 239 / 100, tx0 = (PV_BW - w239) / 2, tx1 = PV_BW - 1 - tx0;   // 2.39:1 framing ticks
+    unsigned x, y, c0, r0, sum = 0, n = 0, clip = 0;
+    static unsigned short pk_prev[PV_BW], col_w[PV_BW];
+    static unsigned char col_sh[PV_BW];
+    static unsigned row_px[PV_BW];   // cached row, burst-copied to uncached PV_RGBA (never reentrant)
+    if (!pv_ok() || mode == 2 || !raw_w || !raw_h) return;
+    if (!pv_m1_lut_ok) pv_build_m1_luts();
+    c0 = raw_w > 240 ? ((raw_w - 240) / 2) & ~1u : 0;
+    r0 = raw_h > 400 ? ((raw_h - 400) / 2) & ~1u : 0;
+    for (x = 0; x < W; x++) {
+        unsigned c = focus ? ((c0 + x * 240 / W) & ~1u) : ((x * raw_w / W) & ~1u), b = c * bpp;
+        col_w[x] = (unsigned short)(b >> 4);
+        col_sh[x] = (unsigned char)((b12 ? 20 : 22) - (b & 15));
+    }
+#define M1W_ROW(D, M, SC, THR) \
+    for (x = 0; x < W; x++) { \
+        const unsigned w = col_w[x], sh = col_sh[x]; \
+        const unsigned v0 = ((unsigned)p0[w] << 16) | p0[w + 1], v1 = ((unsigned)p1[w] << 16) | p1[w + 1]; \
+        unsigned s0 = (v0 >> sh) & (M), s1 = (v0 >> (sh - (D))) & (M), s2 = (v1 >> sh) & (M), s3 = (v1 >> (sh - (D))) & (M); \
+        unsigned mx = s0 > s1 ? s0 : s1, m2 = s2 > s3 ? s2 : s3, px, g; \
+        mx = mx > m2 ? mx : m2; \
+        s0 >>= (SC); s1 >>= (SC); s2 >>= (SC); s3 >>= (SC); \
+        g = (s1 + s2) >> 1; \
+        if (mx >= (THR)) clip++; \
+        if (zebra && mx >= (THR) && (((st * (x + y) + fidx) & 7) < 4)) px = 0xFFFF2800u; \
+        else { \
+            px = lr[s0] | lg[g] | lb_t[s3]; \
+            if (!(x & 3)) { sum += g; n++; } \
+            if (do_peak && mx < (THR) && y > 0 && x > 0) { \
+                unsigned dg_h = g > g_left ? g - g_left : g_left - g; \
+                unsigned dg_v = g > pk_prev[x] ? g - pk_prev[x] : pk_prev[x] - g; \
+                if ((dg_h + dg_v) * 6 > g + g_left + 2 * black + 32) px = 0xFF00FF40u; \
+            } \
+        } \
+        if (do_peak) { pk_prev[x] = (unsigned short)g; g_left = g; } \
+        if (st == 2) { row_px[2 * x] = px; row_px[2 * x + 1] = px; } \
+        else row_px[x] = px; \
+    }
+    for (y = 0; y < H; y++) {
+        unsigned g_left = 0;
+        unsigned r = focus ? r0 + 2 * st * y : (y * raw_h / H) & ~1u;
+        const unsigned short *p0 = (const unsigned short *)(frame + r * lb);
+        const unsigned short *p1 = (const unsigned short *)(frame + (r + 1) * lb);
+        unsigned *o = PV_RGBA + (out_y + st * y) * PV_BW;
+        if (b12) { M1W_ROW(12, 0xfffu, 2, 4080u) }
+        else if (st == 1) {   // 10-bit full-res rows: row r + 1 = q + lb_hw halfwords
+            const unsigned zp = y + fidx;
+            n += (W + 3) >> 2;
+            if (!do_peak) {
+                for (x = 0; x < W; x++) {
+                    const unsigned short *q = p0 + col_w[x];
+                    const unsigned sh = col_sh[x];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[lb_hw] << 16) | q[lb_hw + 1];
+                    const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
+                    const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
+                    const unsigned g = (s1 + s2) >> 1;
+                    if (__builtin_expect((((s0 + 4) | (s1 + 4) | (s2 + 4) | (s3 + 4)) & 0x400u) != 0, 0)) {
+                        clip++;
+                        if (zebra && ((x + zp) & 7) < 4) { row_px[x] = 0xFFFF2800u; if (!(x & 3)) n--; continue; }
+                    }
+                    row_px[x] = lr[s0] | lg[g] | lb_t[s3];
+                    if (!(x & 3)) sum += g;
+                }
+            } else {
+                for (x = 0; x < W; x++) {
+                    const unsigned short *q = p0 + col_w[x];
+                    const unsigned sh = col_sh[x];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[lb_hw] << 16) | q[lb_hw + 1];
+                    const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
+                    const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
+                    const unsigned g = (s1 + s2) >> 1, gp = pk_prev[x], gl = g_left;
+                    const unsigned clp = ((s0 + 4) | (s1 + 4) | (s2 + 4) | (s3 + 4)) & 0x400u;
+                    unsigned px;
+                    pk_prev[x] = (unsigned short)g; g_left = g;
+                    if (__builtin_expect(clp != 0, 0)) {
+                        clip++;
+                        if (zebra && ((x + zp) & 7) < 4) { row_px[x] = 0xFFFF2800u; if (!(x & 3)) n--; continue; }
+                    }
+                    px = lr[s0] | lg[g] | lb_t[s3];
+                    if (!(x & 3)) sum += g;
+                    if (!clp && x && y) {
+                        const unsigned dh = g > gl ? g - gl : gl - g, dv = g > gp ? g - gp : gp - g;
+                        if ((dh + dv) * 6 > g + gl + 2 * black + 32) px = 0xFF00FF40u;
+                    }
+                    row_px[x] = px;
+                }
+            }
+        }
+        else { M1W_ROW(10, 0x3ffu, 0, 1020u) }
+        if (!focus && (st * y < 6 || st * y + st > out_h - 6)) { row_px[tx0] = 0xFF888888u; row_px[tx1] = 0xFF888888u; }
+        memcpy(o, row_px, W * st * 4);
+        if (st == 2) memcpy(o + PV_BW, row_px, W * st * 4);
+    }
+#undef M1W_ROW
+    pv_clip_pct = clip ? ((clip * 100 + W * H - 1) / (W * H)) : 0;
+    pv_stat[0]++; pv_stat[1] = black;
+    if (n) { unsigned cur = sum / n; pv_stat[2] = pv_stat[0] > 1 ? (pv_stat[2] * 3 + cur) >> 2 : cur; }
+}
+/* v185: flush only the row pairs pv_render_m1_wide samples for (mode, half_res), 32-byte aligned. */
+static void pv_dflush_m1_wide(unsigned phys, unsigned lb, unsigned mode, int half_res, unsigned raw_w, unsigned raw_h)
+{
+    unsigned bpp, st, y;
+    if (mode == 2 || !raw_w || !raw_h) return;
+    bpp = lb * 8 / raw_w;
+    if (!bpp) return;
+    st = half_res ? 2 : 1;
+    if (mode == 1) {   // centre 240 x 400
+        const unsigned c0 = raw_w > 240 ? ((raw_w - 240) / 2) & ~1u : 0, r0 = raw_h > 400 ? ((raw_h - 400) / 2) & ~1u : 0;
+        const unsigned H = 200 / st, x0 = (c0 * bpp / 8) & ~31u;
+        unsigned x1 = ((c0 + 242) * bpp / 8 + 4 + 31) & ~31u;
+        if (x1 > lb) x1 = lb;
+        for (y = 0; y < H; y++) {
+            unsigned a = phys + (r0 + 2 * st * y) * lb, s;
+            s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
+            a += lb;
+            s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
+        }
+    } else {           // whole frame: whole row pairs
+        const unsigned oh = raw_h > 1440 ? 124 : 100, H = oh / st;
+        for (y = 0; y < H; y++) {
+            unsigned r = (y * raw_h / H) & ~1u, s = (phys + r * lb) & ~31u, e = (phys + (r + 2) * lb + 31) & ~31u;
+            ((fn2)FN_DFLUSH)(s, e - s);
+        }
+    }
+}
+/* v185: ImgMode 1 preview dispatch (Wide 1:3 vs 1920 x 1440 4:3) */
+static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full); }
+static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr); }
+static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr); }
+/* v182 (B.5) / v184a: preview during an ImgMode 1 take, task M10Pv (prio 0x1E, below M10XR 0x1C / M10Key 0x1D: idle CPU only).
+ * v184a: renders the newest CAPTURED frame k = xr_prod - 1 (cached view + sampled-row dflush) under a seqlock on
+ * xr_prod (the slot of k is rewritten by the capture of frame k + lj_raw_n); half res when the encoder lags >= 2.
+ * v184b: 4:3 always half res (134 x 100, ~10 ms); 1:1 punch-in at full res + peaking while the encoder keeps up; 30 ms pace. */
+static volatile unsigned pv_rec_on = 0, pv_rec_done = 1, pv_rec_n = 0, pv_rec_skip = 0;
+static volatile unsigned pv_rec_skip_bl = 0, pv_rec_skip_torn = 0, pv_rec_ren_sum = 0, pv_rec_ren_max = 0;
+static volatile unsigned pv_hud_dirty = 0;   // v184a: view toggled -> HUD redraw (M10Key in REC, M10PvS in standby)
+static void pv_rec_task(void)
+{
+    unsigned last_k = 0xffffffff, last_mode = 0xffffffff;
+    while (pv_rec_on) {
+        unsigned k, rs, j, dup = 0, hr, cur_mode, t;
+        if (!xr_prod || xr_prod - 1 == last_k) { msleep(10); continue; }
+        k = xr_prod - 1;
+        if (xr_prod - lj_cnt >= lj_raw_n - 1 || (xr_last_drop_ms && get_tick_count() - xr_last_drop_ms < 100) || !pv_ok() || pv_mode == 2) {
+            pv_rec_skip++; pv_rec_skip_bl++; msleep(20); continue;   // encoder late / drop / no LCD / view OFF: leave it the CPU
+        }
+        if (k >= XR_MAX || xr_prod - k >= lj_raw_n - 1) { pv_rec_skip++; msleep(10); continue; }   // too close to the overwrite
+        for (j = (lj_dup_h > LJ_DUP_N ? lj_dup_h - LJ_DUP_N : 0); j < lj_dup_h; j++) if (lj_dup_q[j % LJ_DUP_N] == k) dup = 1;
+        if (dup) { pv_rec_skip++; last_k = k; msleep(10); continue; }                    // HEAD_ERR frame: torn raw
+        cur_mode = pv_mode;
+        hr = (cur_mode == 1 && xr_prod - lj_cnt < 2) ? 0 : 1;   // v184b: 4:3 -> 134 x 100 always; 1:1 full res unless the encoder lags
+        rs = xr_slot[k] % lj_raw_n;
+        if (sh_m1_wide() && (pv_hud_dirty || cur_mode != last_mode)) pv_m1_mask(0);   // v185: Wide letterbox bars repaint on a view toggle
+        last_mode = cur_mode;
+        t = get_tick_count();
+        pv_m1_dflush((unsigned)lj_phys + rs * xr_fb, lvn_lb, cur_mode, hr);
+        pv_m1_render((const char *)((unsigned)lj_phys + rs * xr_fb), lvn_bpp, hr);
+        t = get_tick_count() - t;
+        if (xr_prod - k >= lj_raw_n) { pv_rec_skip++; pv_rec_skip_torn++; continue; }   // slot rewritten meanwhile: not shown
+        vid_bitmap_refresh();
+        last_k = k;
+        pv_rec_n++; pv_has_img = 1;
+        pv_rec_ren_sum += t; if (t > pv_rec_ren_max) pv_rec_ren_max = t;
+        msleep(30);   // v184b: ~12-15 fps live REC preview
+    }
+    pv_rec_done = 1;
+    ExitTask();
+}
+static void pv_rec_start(void)
+{
+    if (!pv_rec_done || !pv_ok()) return;
+    pv_rec_n = pv_rec_skip = pv_rec_skip_bl = pv_rec_skip_torn = pv_rec_ren_sum = pv_rec_ren_max = 0;
+    pv_m1_mask(0);   // v184a: no black wipe (the standby image stays until the first REC frame)
+    pv_rec_done = 0; pv_rec_on = 1;
+    CreateTask("M10Pv", 0x1E, 0x1000, pv_rec_task);
+}
+static void pv_rec_stop(void)
+{
+    unsigned t = get_tick_count();
+    if (pv_rec_done) return;
+    pv_rec_on = 0;
+    while (!pv_rec_done && get_tick_count() - t < 2000) msleep(10);
+    slog("v182 rec preview n=%d skip=%d", pv_rec_n, pv_rec_skip);
+    slog("  v184 bl=%d torn=%d", pv_rec_skip_bl, pv_rec_skip_torn);
+    slog("  v184 ren_avg=%d ren_max=%d", pv_rec_n ? pv_rec_ren_sum / pv_rec_n : 0, pv_rec_ren_max);
+    if (!pv_rec_done) { ts_pinned = 1; slog("v182 rec preview task still running: EXMEM pinned", 0, 0); }   // never free a buffer it may read
 }
 static void pv_render(const char *frame)
 {
     unsigned x, y, sum = 0, n = 0, black = 0, clip = 0, border;
+    if (!pv_ok()) return;
     unsigned lb = lvn_lb;
     const sh_prof_t *pr = sh_on ? sh_prof() : &sh_profs[0];
     unsigned c0 = pr->c0, cw = pr->w;
@@ -3651,23 +4337,102 @@ static void pv_render(const char *frame)
     pv_make_lut(black, pv_stat[2]);
     vid_bitmap_refresh();
 }
+#define FN_DCLEAN   0xfc1267cb
 static void sh_pv_hud(void) { sh_hud(1); }   // v174: minimal HUD (status bar + exposure bar)
+/* v184a / v184b: standby ImgMode 1 preview, async. sh_preview captures back to back into an ns-slot ring (v184b: up
+ * to 8 EXMEM slots, slot = seq % ns, pv_cap_seq = completed captures); task M10PvS (prio 0x1E) renders the newest
+ * complete slot from the cached view and drops it if the ring wrapped onto it meanwhile (seqlock on pv_cap_seq).
+ * v184b: dflush timed apart from the render (pv_stby_fl_sum), msleep(5) per shown frame (Canon tasks never starve). */
+static volatile unsigned pv_stby_on = 0, pv_stby_done = 1, pv_cap_seq = 0, pv_stby_n = 0, pv_stby_torn = 0;
+static volatile unsigned pv_stby_ren_min = 0, pv_stby_ren_max = 0, pv_stby_ren_sum = 0, pv_mask_dirty = 0;
+static volatile unsigned pv_stby_phys = 0, pv_stby_fb = 0, pv_stby_ns = 8, pv_stby_fl_sum = 0;
+static void pv_stby_task(void)
+{
+    unsigned last = 0;
+    while (pv_stby_on) {
+        unsigned f = pv_cap_seq, ns = pv_stby_ns, sl, cur_mode, t, tf, fl;
+        if (pv_mode != 2 && pv_ok()) {
+            /* v185b: sentinel = top-right corner of the opaque mask (21, 358), never touched by the yellow clip % text
+             * at (2, 22) (the old (30, 2) sentinel looped mask + HUD + refresh as soon as a highlight clipped); Wide
+             * focus view has no mask (image fills 360 x 200): watch the opaque top HUD bar (1, 358) instead. */
+            int wiped = (sh_m1_wide() && pv_mode == 1) ? PV_RGBA[1 * PV_BW + 358] != PV_BLACK : PV_RGBA[21 * PV_BW + 358] != PV_BLACK;
+            int masked = 0;
+            if (pv_mask_dirty || wiped) { pv_mask_dirty = 0; pv_m1_mask(0); masked = 1; pv_hud_dirty = 1; }   // overlay erased / view changed
+            if (pv_hud_dirty) { pv_hud_dirty = 0; if (sh_m1_wide() && !masked) pv_m1_mask(0); sh_pv_hud(); }   // v185b: one mask per pass
+        }
+        if (!f || f == last || pv_mode == 2 || !pv_ok()) { msleep(5); continue; }
+        sl = (f - 1) % ns;
+        cur_mode = pv_mode;
+        t = get_tick_count();
+        pv_m1_dflush(pv_stby_phys + sl * pv_stby_fb, lvn_lb, cur_mode, 0);
+        tf = get_tick_count();
+        pv_m1_render((const char *)(pv_stby_phys + sl * pv_stby_fb), lvn_bpp, 0);
+        fl = tf - t; t = get_tick_count() - tf;   // v184b: fl = dflush ms, t = render ms
+        last = f;
+        if (pv_mode == 2) { pv_mask_dirty = 1; pv_has_img = 0; continue; } // switched OFF meanwhile: sh_preview blacks it
+        if (pv_cap_seq - f >= (ns > 1 ? ns - 1 : 1)) { pv_stby_torn++; continue; }   // capture f+ns-1 reuses slot (f-1)%ns
+        vid_bitmap_refresh();
+        msleep(5);   // v184b: yield to the Canon tasks at prio >= 0x1E every shown frame
+        pv_stby_n++; pv_has_img = 1;
+        pv_stby_fl_sum += fl;
+        pv_stby_ren_sum += t;
+        if (!pv_stby_ren_min || t < pv_stby_ren_min) pv_stby_ren_min = t;
+        if (t > pv_stby_ren_max) pv_stby_ren_max = t;
+        if (pv_hud_dirty || (pv_stby_n & 7) == 1) { if (pv_hud_dirty && sh_m1_wide()) pv_m1_mask(0); pv_hud_dirty = 0; sh_pv_hud(); }
+    }
+    pv_stby_done = 1;
+    ExitTask();
+}
 static void sh_preview(char *buf, unsigned phys, unsigned lines)
 {
-    unsigned fails = 0, dt, endp;
+    unsigned fails = 0, dt, endp, fb = lines * lvn_lb, ns = 1, cap_ms = 0;
+    int m1 = x_m1 && sh_is_m1();   // v182: ImgMode 1 1440p preview (colour, opaque mask, 3 views)
     sh_pv_key = 0; sh_pv_n = 0; pv_stat[0] = 0; pv_clip_pct = 0;
     pv_geom(); sh_hud_clear();
-    pv_make_lut(64, 300);
-    slog("v165 preview start lines=%d", lines, 0);
+    pv_make_lut(m1 ? 127 : 64, 300);
+    if (m1) {
+        x_px = 0;
+        ns = (x_exsz > 0x00080000 && fb) ? (x_exsz - 0x00080000) / fb : 1; if (ns > 8) ns = 8; if (ns < 1) ns = 1;   // v184b: up to 8 slots (48 MiB: ~300-420 ms wrap margin)
+        pv_m1_mask(pv_has_img ? 0 : 1); sh_pv_hud();   // v184a: REC -> Standby keeps the last image (no black flash)
+        pv_cap_seq = 0; pv_stby_n = pv_stby_torn = pv_stby_ren_min = pv_stby_ren_max = pv_stby_ren_sum = pv_stby_fl_sum = 0;
+        pv_hud_dirty = pv_mask_dirty = 0;
+        pv_stby_phys = phys; pv_stby_fb = fb; pv_stby_ns = ns;
+        if (pv_stby_done) { pv_stby_done = 0; pv_stby_on = 1; CreateTask("M10PvS", 0x1E, 0x1000, pv_stby_task); }
+    }
+    slog("v165 preview start lines=%d ns=%d", lines, ns);
     for (;;) {
         int r;
+        unsigned sl = m1 ? pv_cap_seq % ns : 0, t0;
         if (sh_stop_req) { sh_pv_key = 1; break; }                          // REC (keywatch)
+        if (kbd_is_key_pressed(KEY_SET) && !kbd_is_key_pressed(KEY_MENU)) { sh_pv_key = 2; break; }   // v182: SET starts REC too
         if (sh_quit_req || (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET))) { sh_pv_key = 3; break; }   // v176: MENU held / MENU+SET = quit
         if (sh_usb()) { sh_pv_key = 4; break; }
-        if (shamem(0xc0f06804) != 0x045702a6 || *(volatile unsigned *)DSS_FLAGS == 0) { sh_pv_key = 5; break; }
-        { int nv = sh_handle_nav(1); if (nv == 2) { pv_clear(); pv_geom(); } if (nv) sh_pv_hud(); }
+        if (m1) {                                                          // v182: hold while ImgMode 1 runs (no magnifier head here)
+            if (!m1_ready() || *(volatile unsigned *)DSS_FLAGS == 0) {
+                sh_pv_key = 5;
+                slog("v184c key=5 is=%d tg=%d", *(volatile unsigned *)0x865c, *(volatile unsigned *)0xe664);   // v184c: exact state
+                slog("  dss=%x rec=%d", *(volatile unsigned *)DSS_FLAGS, (unsigned)camera_info.state.mode_rec);
+                break;
+            }
+            if (!sh_is_m1() || sh_m1_geom(sh_prof()) != sh_m1_armed_geom) { sh_pv_key = 7; break; }                     // profile changed away from 1440p
+        } else if (shamem(0xc0f06804) != 0x045702a6 || *(volatile unsigned *)DSS_FLAGS == 0) { sh_pv_key = 5; break; }
+        {
+            int nv = sh_handle_nav(m1 ? 0 : 1);
+            if (m1) { if (nv == 2) pv_mask_dirty = 1; if (nv) pv_hud_dirty = 1; }   // v184a: drawn by M10PvS (no sync draw)
+            else { if (nv == 2) { pv_clear(); pv_geom(); } if (nv) sh_pv_hud(); }
+            if (m1 && (!sh_is_m1() || sh_m1_geom(sh_prof()) != sh_m1_armed_geom)) { sh_pv_key = 7; break; }
+        }
+        if (m1 && pv_mode == 2) {                                         // view OFF: no capture at all, black mask + HUD + keys
+            if (pv_ok() && (pv_mask_dirty || pv_hud_dirty || PV_RGBA[21 * PV_BW + 358] != PV_BLACK || PV_RGBA[120 * PV_BW + 180] != PV_BLACK)) {
+                pv_mask_dirty = pv_hud_dirty = 0; pv_m1_mask(1); sh_pv_hud();
+            }
+            wb_mon(0); sh_gui_assert();
+            msleep(100);
+            continue;
+        }
         dt = endp = 0;
-        r = lvn_cap(buf, phys, lines, &dt, &endp);
+        t0 = get_tick_count();
+        r = lvn_cap(buf + sl * fb, phys + sl * fb, lines, &dt, &endp);
         if (px_on) px_close();
         if (*(volatile unsigned *)(0x0000fa68 + 0x1c)) {                    // trapped head error: acknowledge, re-arm (as REC)
             *(volatile unsigned *)(0x0000fa68 + 0x1c) = 0;
@@ -3677,16 +4442,28 @@ static void sh_preview(char *buf, unsigned phys, unsigned lines)
             fails++; msleep(r == 2 ? 10 : 80);
         } else {
             fails = 0;
-            pv_render(buf);
+            if (m1) { cap_ms += get_tick_count() - t0; pv_cap_seq++; }    // v184a: hand the slot to M10PvS, capture the next one at once
+            else pv_render(buf);
             sh_pv_n++;
-            if ((sh_pv_n & 3) == 1) sh_pv_hud();
+            if (!m1 && (sh_pv_n & 7) == 1) sh_pv_hud();   // v183b: 1/8
         }
         if (fails >= 20) { sh_pv_key = 6; break; }
         wb_mon(0); sh_gui_assert();
-        msleep(20);                                                         // ~10 fps, leaves frames to Canon
+        if (!m1) msleep(20);                                                // v184a: ImgMode 1 back to back (lvn_cap paces on the sensor)
     }
     if (px_on) px_close();
-    pv_clear();
+    if (m1) {
+        unsigned t = get_tick_count();
+        pv_stby_on = 0;
+        while (!pv_stby_done && get_tick_count() - t < 2000) msleep(10);
+        if (!pv_stby_done) { ts_pinned = 1; slog("v184 stby preview task still running: EXMEM pinned", 0, 0); }   // never free a buffer it may read
+        if (sh_is_m1() && sh_pv_key != 1 && sh_pv_key != 2) pv_m1_mask(1);   // v184a: REC/SET keep the image into REC
+        slog("v184 stby cap=%d ren=%d", sh_pv_n, pv_stby_n);
+        slog("  v184 cap_avg=%d torn=%d", sh_pv_n ? cap_ms / sh_pv_n : 0, pv_stby_torn);
+        slog("  v184 ren min=%d avg=%d", pv_stby_ren_min, pv_stby_n ? pv_stby_ren_sum / pv_stby_n : 0);
+        slog("  v184 ren max=%d", pv_stby_ren_max, 0);
+        slog("  v184b fl_avg=%d ren_avg=%d", pv_stby_n ? pv_stby_fl_sum / pv_stby_n : 0, pv_stby_n ? pv_stby_ren_sum / pv_stby_n : 0);
+    } else pv_clear();
     slog("v165 preview end key=%d frames=%d", sh_pv_key, sh_pv_n);
     slog("  v165 black=%d mean=%d", pv_stat[1], pv_stat[2]);
 }
@@ -3698,12 +4475,12 @@ static void lv_x3(void)
     int fd, ok = 1;
 
     if (ts_pinned) { strcpy(msg, "EXMEM pinned: redemarrer"); return; }
-    msg[0] = 0; x_chf = 0; x_xo = 0; x_lo = 2000; x_hi = 7000;
+    msg[0] = 0; x_chf = 0; x_xo = 0; x_lo = 2000; x_hi = 7000; x_trg = 0; x_trg_done = 0; x_trg_us = 0; trg_busy = 0; trg_skip = 0;   // v179
     px_cycle = 6; x_need = 0; x_start_us = 0; ch_idx = 12; x_he_mode = 0; x_dc = 99; x_skipy = 0; x_skipn = 0; x_skips = 0; x_skip_fr = 0; x_enc = 0; x_csh = 4; x_unpk = 0; x_unpk_set = 0; x_j9c = 0; x_jpn = 0; enc_wr2 = 9; enc_rd = 0x23; lj_eh = 0; enc_w2w = enc_w2h = 0; x_epn = 0; lj_ns = 1; lj_gap = 0; lj_new_win = 0; lj_last_win = 0; lj_swlo = lj_swhi = 0; lj_swch = 0x40000; enc_mode = 1; x_rowm = 1; enc_prm_a = enc_prm_b = 0; enc_wov = 0; enc_rdb = 0; enc_wstride = 0; lj_wlo = lj_whi = 0; x_hbn = 6; lj_swe = 0; lj_eoff = 0; lj_kwait = 8000; lj_chase = 0; lj_chased = 0; lj_chase_n = 0; lj_chase_miss = 0; lj_u371 = 0; lj_ebits = 0; lj_rdf = 0; x_her = 0; x_exsz = EXMEM_SIZE; x_pbl = 0; x_skick = 0; ts_period = 0; x_rsel = 0; x_he_fix = 0; x_he_fixed = 0; x_dup_us_max = 0;           // v73 defaults (6 frames = 240 ms max hold of sem #6)
     fd = sh_on ? -1 : open("A/M10X3.CFG", O_RDONLY, 0777);
     if (sh_on || fd >= 0) {
         int n;
-        if (sh_on) { n = strlen(SH_RECIPE); memcpy(cfg, SH_RECIPE, n); }   // v160: built-in recipe
+        if (sh_on) { unsigned kd = sh_prof()->kind; const char *rc = kd == SH_M1 ? SH_RECIPE_M1 : (kd == SH_X3 && !sh_pv) ? SH_RECIPE_X3 : SH_RECIPE; n = strlen(rc); memcpy(cfg, rc, n); }   // v160: built-in recipe (v178: 1x3, v182: ImgMode 1)
         else { n = read(fd, cfg, sizeof(cfg) - 1); close(fd); }
         if (n > 0) {
             char *q = cfg;
@@ -3716,10 +4493,10 @@ static void lv_x3(void)
             if (*q) fl = strtol(q, &q, 10);         // v32 flags
             if (*q) x_chf = (unsigned)strtol(q, &q, 16);      // v68: CH12 EDMAC flags override
             if (*q) x_xo = hex_u32(&q);                        // v72: options (v84b: unsigned parse, bit 31 usable)
-            if (*q) { unsigned v = strtol(q, &q, 10); if (v >= 500 && v <= 9000) x_lo = v; }
-            if (*q) { unsigned v = strtol(q, &q, 10); if (v > x_lo && v <= 15000) x_hi = v; }   // v152: up to 15 ms (readout starts at 8830 + 16 ms; a DMA stretched by a periodic Canon load ends at + 8..15 ms)
+            if (*q) { unsigned v = strtol(q, &q, 10); if (v <= 40000) x_lo = v; }   // v180d: allow blanking offset up to 40 ms in m1
+            if (*q) { unsigned v = strtol(q, &q, 10); if (v > x_lo && v <= 45000) x_hi = v; }   // v180d: allow window end up to 45 ms in m1
             if (*q) { unsigned v = strtol(q, &q, 10); if (v <= 50) px_cycle = v; }    // v73: frames per sem #6 hold (0 = whole run)
-            if (*q) { unsigned v = strtol(q, &q, 10); if (v <= 1280) x_need = v; }    // v73: min lines of a kept short frame
+            if (*q) { unsigned v = strtol(q, &q, 10); if (v <= 1800) x_need = v; }    // v73/v180/v185: min lines of a kept short frame
             if (*q) { unsigned v = strtol(q, &q, 10); if (v <= 30000) x_start_us = v; }   // v79
             if (*q) { unsigned v = strtol(q, &q, 10); if (v == 2 || v == 5 || v == 11 || v == 12 || v == 14 || v == 18 || v == 19) ch_idx = v; }   // v81
             if (*q) x_he_mode = strtol(q, &q, 10);      // v85: 16th field
@@ -3741,7 +4518,7 @@ static void lv_x3(void)
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v <= 6 || (v >= 7 && v <= 13)) enc_wr2 = v; }   // v104: 24th field = encoder WR2 channel
             if (*q && *q != '\n') { lj_wlo = strtol(q, &q, 10); if (*q) lj_whi = strtol(q, &q, 10); }   // v105: 25th/26th = encoder start window
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 25 && v <= 47) enc_rd = v; }   // v106: 27th = encoder read channel
-            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 16 && v <= 1184) lj_eh = v & ~1u; }   // v107: 28th = encoder lines
+            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 16 && v <= 1800) lj_eh = v & ~1u; }   // v107/v180: 28th = encoder lines
             if (*q && *q != '\n') { enc_w2w = strtol(q, &q, 10); if (*q) enc_w2h = strtol(q, &q, 10); }   // v110: 29th/30th = WR2 (preview) w h
             while (*q == ' ') q++;
             while (*q && *q != '\n' && x_epn < 4) {   // v111: 31st field = AAAAAAAA:VVVVVVVV[|][,...] engine pokes after encoder setup ('|' = OR)
@@ -3768,25 +4545,42 @@ static void lv_x3(void)
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v < 0x100000 && !(v & 3)) lj_eoff = v; }   // v139: 46th = encoder source offset (bytes, 4-aligned)
             if (*q && *q != '\n') lj_swe = strtol(q, &q, 10);   // v142: 47th = SD write only while the encoder is idle
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 2 && v <= 32) x_hbn = v; }   // v143: 48th = burst stop threshold
-            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v < 1184) lj_chase = v; }   // v144: 49th = chase start line (0 = off)
+            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v < 1800) lj_chase = v; }   // v144/v180: 49th = chase start line (0 = off)
             if (*q && *q != '\n') lj_u371 = strtol(q, &q, 16);   // v145: 50th = c0f371fc raw value (hex) for REC encodes
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v == 1 || v == 2) lj_ebits = v; }   // v146: 51st = encoder depth code
             if (*q && *q != '\n') lj_rdf = strtol(q, &q, 16) & 0x60001000u;   // v147: 52nd = RD1 transfer-size flags (hex)
             if (*q && *q != '\n') x_her = strtol(q, &q, 10);   // v148: 53rd = no-pause head-error recovery
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 16 && v <= 48) x_exsz = v << 20; }   // v149: 54th = EXMEM MiB
-            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v <= 1184) x_pbl = v; }   // v150: 55th = busy-poll lines
+            if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v <= 1800) x_pbl = v; }   // v150/v180: 55th = busy-poll lines
             if (*q && *q != '\n') x_skick = strtol(q, &q, 10);   // v151: 56th = kick on short frames
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 10); if (v >= 1000 && v <= 10000) ts_period = v; }   // v153: 57th = task sampler us (0 off)
             if (*q && *q != '\n') { unsigned v = strtol(q, &q, 16); if (v == 0x10 || v == 0x12 || v == 0x22 || v == 0x2e) x_rsel = v; }   // v169: 58th = raw selector (hex)
             if (*q && *q != '\n') x_he_fix = strtol(q, &q, 10);   // v172: 59th = replace HEAD_ERR frames by previous healthy frame
         }
     }
-    if (sh_on) {
+    if (!sh_on) {   // v179: trigger block address (hex) in A/M10TRG.CFG (host test only; deleted by the host after use)
+        int tf = open("A/M10TRG.CFG", O_RDONLY, 0777);
+        if (tf >= 0) {
+            char tb[24], *q = tb; int tn = read(tf, tb, sizeof(tb) - 1); close(tf);
+            if (tn > 0) { unsigned a; tb[tn] = 0; a = hex_u32(&q); if (a >= 0x1000 && a < 0x40000000 && !(a & 3)) x_trg = (unsigned *)a; }
+        }
+    }
+    if (sh_on && sh_prof()->kind == SH_M1) {   // v182: ImgMode 1 1440p: the capture is already 1920 wide (no encoder crop)
         const sh_prof_t *pr = sh_prof();
-        if (!sh_pv) { bpp = pr->bpp; x_rsel = pr->rsel; x_he_fix = 1; }   // v172: preview stays 10-bit; REC uses profile depth/selector + HE replacement
+        lines = pr->h;                                 // v185: profile frame height (1440 / 1800)
+        if (pr->h > 1440) x_lo = 37600;                // v185b: Standby + REC arm inside V-blank (Wide 1800 readout ends at 37018 us)
+        if (!sh_pv) {
+            bpp = pr->bpp; x_rsel = 0x10; x_he_fix = 1; lj_eoff = 0; enc_wov = 0;
+            x_need = pr->h - 4; lj_eh = pr->h;
+            lj_kwait = (pr->bpp == 12) ? 300 : 8000;
+        }
+        else { bpp = 10; x_rsel = 0x10; x_he_fix = 0; x_need = pr->h - 4; }   // v185b: Standby waits for the full head too
+    } else if (sh_on) {
+        const sh_prof_t *pr = sh_prof();
+        if (!sh_pv) { bpp = pr->bpp; x_rsel = pr->rsel; x_he_fix = pr->kind == SH_X3 ? 0 : 1; }   /* v178: 1x3 keeps HE frames (host repair) */   // v172: preview stays 10-bit; REC uses profile depth/selector + HE replacement
         else { bpp = 10; x_rsel = 0; x_he_fix = 0; }   // v174: recipe is now the 14-bit REC line; preview keeps its v165 10-bit path
         enc_wov = pr->w;
-        lj_eoff = pr->c0 * bpp / 8;
+        if (pr->kind != SH_X3) lj_eoff = pr->c0 * bpp / 8;   // v178: 1x3 keeps the recipe offset (row 28, column 136)
     }
     if (x_he_fix && (!(fl & 0x100) || !(fl & 0x1000000) || !(x_xo & 0x80000000) || !x_her ||
                      x_enc != 11 || lj_ns != 1 || lj_new_win != 2 || lj_chase)) {
@@ -3807,16 +4601,28 @@ static void lv_x3(void)
     if (npass > LVM2_PASS && !(fl & 0x104)) npass = LVM2_PASS;
     if (npass > XR_MAX) npass = XR_MAX;                 // v33: long runs reuse the buffer (no image file)
     if (lines < 16) lines = 256;
-    if (lines > 1280) lines = 1280;                 // one block < 4 MiB (lvn_fits)
+    if (lines > 1800) lines = 1800;                 // v180/v185: up to 1800 lines (< 4 MiB checked below)
+    x_m1 = (*(volatile unsigned *)0x865c == 1) ? 1 : 0;   // v180: ImgMode 1 continuous 1440p
+    x_hi_post = x_m1 ? 45000 : 30000;   // v180d: m1 restore waits for CMOS 0 + x_lo (~35 ms)
     // v65: Film 1x3 frame = 1185 lines at the CH12 end (1190 head - 5): asking
     // more leaves the DMA armed -> Canon's chain dies a few frames later (r84c).
     { unsigned hh = (shamem(0xc0f06804) >> 16) & 0xffff;   // v89s: any tall head (live103: 1254...) -> CH12 frame = H - 6
-      if ((fl & 0x20000000) && hh >= 0x4a6 && hh <= 1280 + 6 && lines > ((x_xo & 0x1000) ? hh : hh - 6)) lines = (x_xo & 0x1000) ? hh : hh - 6; }   // v75d: xo 0x1000 = ask more, end by the 8830 abort
+      if (!x_m1 && (fl & 0x20000000) && hh >= 0x4a6 && hh <= 1280 + 6 && lines > ((x_xo & 0x1000) ? hh : hh - 6)) lines = (x_xo & 0x1000) ? hh : hh - 6; }   // v75d: xo 0x1000 = ask more, end by the 8830 abort
     if (bpp != 10 && bpp != 12) bpp = 14;
-    x_zoom = zoom_head(shamem(0xc0f06804)) ? 1 : 0;   // v156: x5 magnifier, 2592 x 1108, 33.3 ms frames (v168z: tall heads too)
+    x_zoom = (!x_m1 && zoom_head(shamem(0xc0f06804))) ? 1 : 0;   // v156/v180: x5 magnifier, 2592 x 1108
     x_w = x_zoom ? 2592 : LVN_W; x_per = x_zoom ? 33307 : 40000;
     if (x_zoom) { unsigned m = *(volatile unsigned *)0x865c, pc = (m < 0x34) ? *(volatile unsigned *)(0x575b0 + 36 * m + 0x1c) : 0; if (pc >= 20000 && pc <= 60000) x_per = pc; }   // v158: m10zfps.py sets 40017
     if (x_zoom) { unsigned zl = (shamem(0xc0f06804) >> 16) - 7; if (lines > zl) lines = zl; }   // native 1111-line head -> 1104 (v168z: H - 7)
+    if (x_m1) {
+        unsigned h6800 = shamem(0xc0f06800), h6804 = shamem(0xc0f06804);
+        unsigned hw = ((h6804 & 0xffff) - (h6800 & 0xffff)) * 4;
+        unsigned hh = (h6804 >> 16) - (h6800 >> 16) + 1;
+        unsigned pc = *(volatile unsigned *)(0x575b0 + 36 * 1 + 0x1c);
+        if (hw >= 640 && hw <= 2592 && !(hw & 15)) x_w = hw;
+        if (hh >= 64 && lines > hh) lines = hh;
+        if (pc >= 20000 && pc <= 160000) x_per = pc;
+        if (x_hi + 1200 < x_per && x_per - 1200 > x_lo) x_hi = x_per - 1200;   // v180f (r159): arm window up to per - 1.2 ms (4 -> 5.3 ms at 24p: skips 7 -> 2 /99)
+    }
     if (enc_wov > x_w) enc_wov = 0;                        // v159
     lvn_bpp = bpp; lvn_lb = x_w * bpp / 8;
     {   // v170: allow 2-block CH12 (> 4 MiB) when cropping 14-bit into a < 4 MiB encoder window
@@ -3836,6 +4642,7 @@ static void lv_x3(void)
     slog("v25 LVX3 start 6804=%08x npass=%d", lm2.r6804, npass);
     slog("  lines=%d bpp=%d", lines, bpp);
     slog("  v156 zoom=%d w=%d", x_zoom, x_w); slog("  v158 per=%d us", x_per, 0);
+    if (x_m1) slog("  v180 m1=1 lines=%d", lines, 0);
     slog("  v32 flags=%x gap=%d", fl, gap);
     idle_polls = (fl & 8) ? 2 : 20;
     lvn_post_ms = (fl & 0x10) ? 8 : 0;
@@ -3867,6 +4674,7 @@ static void lv_x3(void)
     slog("  v68 ch12 flags=%08x", x_chf ? x_chf : ((x_xo & 4) ? 0x1000 : 0x40000000), 0);
     slog("  v72 xo=%x lo=%d", x_xo, x_lo);
     slog("  v72 hi=%d", x_hi, 0);
+    slog("  v179 trg=%08x", (unsigned)x_trg, 0);
     if (sync_first) sync_delay_us = 0;
     if (fl & 0x80) { idle_polls = 0; gap = 0; }     // v36: back-to-back (every frame)
     // v73: persistent pipeline: 8830 sync with the CPU-friendly window only,
@@ -3875,7 +4683,7 @@ static void lv_x3(void)
     x_px = ((x_xo & 0x10) && lvn_sync == 4 && !x_prec) ? 1 : 0;
     if (x_px) { x_xo |= 1; idle_polls = 0; gap = 0; }   // ch12_idle 20 x msleep(5) / a gap would miss the window
     px_on = 0; px_opens = px_frames = px_late = px_rearm_err = px_pulses = 0; x_short_bad = 0;
-    { unsigned hh = (shamem(0xc0f06804) >> 16) & 0xffff; x_flines = (hh >= 0x4a6 && hh <= 1286) ? hh - 6 : 0; }   // v65: CH12 frame = 1184-1185 lines (head 1190); v89s: H - 6
+    { unsigned hh = (shamem(0xc0f06804) >> 16) & 0xffff; x_flines = x_m1 ? lines : ((hh >= 0x4a6 && hh <= 1286) ? hh - 6 : 0); }   // v65/v180
     slog("  v73 px=%d cycle=%d", x_px, px_cycle);
     slog("  v73 need=%d flines=%d", x_need, x_flines);
     slog("  v80 build xo=%x diag=%d", x_xo, x_diag);
@@ -3960,18 +4768,23 @@ static void lv_x3(void)
         return;
     }
     if (fl & 0x100) {                               // v37: record to card
-        unsigned drops = 0, fr = 0, t0, maxbl = 0;
+        unsigned drops = 0, fr = 0, t0, maxbl = 0, xr_slot_cnt = 0, xr_t0_ms = 0;   // v183: 24.00p slots, REC t0
         if (npass > XR_MAX) npass = XR_MAX;
         xr_fb = lines * lvn_lb;
         xr_mlv = (fl & 0x1000000) ? 1 : 0;          // v55: MLV output
         xr_nullsz = ((xr_fb + 16 + 511) & ~511u) - xr_fb;
         xr_stride = 512 + xr_fb + xr_nullsz;
         xr_nslot = (x_exsz - 0x00080000) / (xr_mlv ? xr_stride : xr_fb);
-        lj_on = (x_enc == 11 && xr_mlv && (lvn_bpp == 10 || (lvn_bpp == 14 && (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * 14 / 8 <= 0x00400000))) ? 1 : 0;   // v101/v170: compressed REC (10b or <4 MiB cropped 14b)
+        lj_on = (x_enc == 11 && xr_mlv && (lvn_bpp == 10 || ((lvn_bpp == 14 || lvn_bpp == 12) && (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * lvn_bpp / 8 <= 0x00400000))) ? 1 : 0;   // v101/v170: compressed REC (10b or <4 MiB cropped 14b); v177: 12b too
         if (lj_on) {    // raw ring 3 x xr_fb, compressed ring after it, last 512 KiB = SIO copy
             unsigned enc_fb = (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * lvn_bpp / 8;
             lj_raw_n = 3; lj_cbase = (lj_raw_n * xr_fb + 0xfff) & ~0xfffu;
-            lj_cslot_sz = x_zoom ? ((enc_fb + enc_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000; lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
+            lj_cslot_sz = (x_zoom || x_m1 || lvn_bpp == 12) ? ((enc_fb + enc_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000;   /* v177/v180: slots sized by frame */ lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
+            if (x_m1) {   // v181 (r159): raw ring 5 absorbs encoder jitter (12b mean 41.5 < 41.67 ms); compressed slots end before WR2 (x_exsz - 0xC0000)
+                unsigned cb5 = (5 * xr_fb + 0xfff) & ~0xfffu, n5 = (x_exsz - 0x000C0000 - cb5) / lj_cslot_sz;
+                if (n5 >= 4) { lj_raw_n = 5; lj_cbase = cb5; lj_cslot_n = n5; }
+                else lj_cslot_n = (x_exsz - 0x000C0000 - lj_cbase) / lj_cslot_sz;
+            }
             if (x_he_fix) {
                 if (lj_cslot_n > LJ_MAP_N) lj_cslot_n = LJ_MAP_N;
                 if (lj_cslot_n < 2) { exmem_free_uncached(EXMEM_TYPE); strcpy(msg, "HEFIX: slots insuffisants"); return; }
@@ -3979,10 +4792,10 @@ static void lv_x3(void)
             }
             xr_nslot = lj_raw_n; lj_cnt = lj_err = lj_done = 0; lj_gate = (fl & 0x200) ? 1 : 0; if (lj_new_win == 2) lj_gate = 2;   // v119: 34th field 2 = slices after readout ends   // v103: flag 0x200 = gated encoder (writes stay ungated in LJ mode)
             lj_buf = (unsigned char *)buf; lj_phys = phys;
-            enc_w = enc_wov ? enc_wov : x_w; enc_h = lj_eh ? lj_eh : lines; enc_bits = lj_ebits ? lj_ebits : 2; enc_rd10 = (lvn_bpp == 10) ? 1 : 0; enc_unpk = 0; enc_prec = 0;   // v170: enc_rd10=0 for 14-bit; v146 lj_ebits
+            enc_w = enc_wov ? enc_wov : x_w; enc_h = lj_eh ? lj_eh : lines; enc_bits = lj_ebits ? lj_ebits : 2; enc_rd10 = (lvn_bpp == 10 || lvn_bpp == 12) ? 1 : 0; enc_rd12 = (lvn_bpp == 12) ? 1 : 0; enc_unpk = (lvn_bpp == 12) ? 0x10 : 0; enc_prec = 0;   // v170: enc_rd10=0 for 14-bit; v146 lj_ebits; v177: 12b = RD1 depth 1 + unpacker 0x10 (<< 2)
             enc_wr2_off = x_exsz - 0x00080000 - 0x00040000; enc_no_snap = 1; sem_enc = 0;
             {
-                int hf = open((lvn_bpp == 14) ? "A/M10HUF14.BIN" : "A/M10HUF.BIN", O_RDONLY, 0777);
+                int hf = open((lvn_bpp == 14) ? "A/M10HUF14.BIN" : (lvn_bpp == 12) ? "A/M10HUF12.BIN" : "A/M10HUF.BIN", O_RDONLY, 0777);   // v177: 12-bit table
                 enc_huff_ok = 0;
                 if (hf >= 0) { if (read(hf, enc_huff, 96) == 96) enc_huff_ok = 1; close(hf); }
             }
@@ -3991,9 +4804,19 @@ static void lv_x3(void)
         }
         xr_buf = buf; xr_prod = xr_wr = xr_stop = xr_done = xr_err = 0;
         lm2.npass = npass;
+        { char nm[24]; sprintf(nm, "%s.%s", xr_base, xr_mlv ? "MLV" : "RAW"); remove(nm); }   // v180f: free the old take first
+        if (x_m1 && x_warm) {   // v180f (r159): 1st 2 MiB write of a take took 0.85-0.9 s (FAT free-cluster search) -> 11 ring drops. Pre-write x_warm MiB from the REC buffer, delete, then open.
+            unsigned tw = get_tick_count(), m, wsz = 0x00200000;
+            int wf = open("A/M10WARM.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);
+            if (wf >= 0) {
+                for (m = 0; m < x_warm; m += 2) { if (write(wf, buf, wsz) != (int)wsz) break; wb_mon(0); }
+                close(wf); remove("A/M10WARM.BIN");
+            }
+            slog("  v180f warm %d MiB ms=%d", x_warm, get_tick_count() - tw);
+        }
         { char nm[24]; sprintf(nm, "%s.%s", xr_base, xr_mlv ? "MLV" : "RAW"); xr_fd = open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0777); }
         if (xr_fd < 0) { exmem_free_uncached(EXMEM_TYPE); strcpy(msg, "RAW open err"); return; }
-        xr_fileno = 0; xr_fbytes = 512; xr_chunk_start = 0;
+        xr_fileno = 0; xr_fbytes = 512; xr_chunk_start = 0; xr_roll_ms = xr_roll_n = xr_roll_fr = xr_roll_drops = 0;   // v182
         mlv_guid_lo = get_tick_count();
         mlv_crop = lj_on && (enc_wov || lj_eh || lj_eoff);
         if (mlv_crop) slog("  v159 crop %dx%d", enc_w, enc_h), slog("  v159 eoff=%d", lj_eoff, 0);
@@ -4002,23 +4825,32 @@ static void lv_x3(void)
         xr_sem = CreateBinarySemaphore("M10XR", 0);
         memset(tlf, 0, sizeof(tlf));   // v140
         capl = (unsigned (*)[5])(buf + x_exsz + TS_EXTRA); memset(capl, 0, CAP_BYTES); cap_n = 0; cap_k = 0xffffffff;   // v154: inside the REC-only reserve allocated above
-        if (lj_on) { lj_sem = CreateBinarySemaphore("M10LJ", 0); lj_sem_p = &lj_sem; x_early = (lj_new_win == 2); x_ready = 0; x_dr[0] = x_dr[1] = x_dr[2] = 0; lj_kicked = 0; lj_k_ok = 0; lj_k_no[0] = lj_k_no[1] = lj_k_no[2] = lj_k_no[3] = 0; lj_k_max = 0; lj_prev_sz = 0; lj_prev_tot = 0; lj_dup_h = 0; lj_dup_t = 0; x_kick = (lj_new_win == 2 && lj_ns == 1) ? lj_kick : 0; CreateTask("M10LJ", 0x1B, 0x1000, lj_task); }   // v124: back to 0x1B (0x19 starved the capture)   // v121   // v101: between capture (0x1A) and writer (0x1C)
+        if (lj_on) { lj_sem = CreateBinarySemaphore("M10LJ", 0); lj_sem_p = &lj_sem; x_early = (lj_new_win == 2); x_ready = 0; x_dr[0] = x_dr[1] = x_dr[2] = 0; lj_kicked = 0; lj_k_ok = 0; lj_k_no[0] = lj_k_no[1] = lj_k_no[2] = lj_k_no[3] = 0; lj_k_max = 0; lj_prev_sz = 0; lj_prev_tot = 0; lj_dup_h = 0; lj_dup_t = 0; x_kick = (lj_new_win == 2 && lj_ns == 1) ? lj_kick : 0; x_poll = (x_kick && x_m1) ? lj_poll : 0; lj_async_n = 0; CreateTask("M10LJ", 0x1B, 0x1000, lj_task); }   // v124: back to 0x1B (0x19 starved the capture)   // v121   // v101: between capture (0x1A) and writer (0x1C)
         xr_gated = ((fl & 0x200) && !lj_on) ? 1 : 0;           // v39 (v103: LJ uses 0x200 for the encoder)
         xr_wlen = (wms && wms * 1024 < xr_fb) ? wms * 1024 : xr_fb;   // v41: 4th field = KiB written per frame
         xr_chunk = (fl & 0x800) ? 0x200000 : 0x20000;                // v41: bit11 big chunks
         slog("  v41 wlen=%d chunk=%d", xr_wlen, xr_chunk);
         xr_gate = 1;
-        CreateTask("M10XR", 0x1C, 0x1000, xr_task);  // v38: BELOW the capture (0x1A): never preempts a PACK32 hold
+        CreateTask("M10XR", 0x1C, 0x2000, xr_task);  // v38: BELOW the capture (0x1A): never preempts a PACK32 hold (v182: 8 KiB stack)
+        if (sh_on && x_m1 && lj_on && pv_mode != 2) pv_rec_start();   // v182: live preview of encoded frames (prio 0x1E, idle CPU only)
         wait_sleep = (fl & 0x2000) ? 0 : 1;        // v42: bit13 busy sync in REC
         ts_start(buf + x_exsz);   // v153: after worker creation / before first readout
         slog_len = 0; slog_lost = 0; slog_defer = 1;   // v155: no card log I/O from the capture loop
+        xr_last_drop_ms = 0;   // v183
+        if (x_m1 && lj_on) {   // v183: 2 pre-roll captures (not published, encoder not kicked) before t0
+            x_early = 0;
+            for (i = 0; i < 2 && !(sh_on && sh_stop_req); i++) { unsigned dt0 = 0, ep0 = 0; lvn_cap(buf, phys, lines, &dt0, &ep0); }
+            x_early = (lj_new_win == 2);
+        }
         t0 = get_tick_count();
+        xr_slot_cnt = 0; xr_t0_ms = t0;
+        wb_defer = x_m1; wb_due = 0; wb_late_n = 0;   // v180f
         for (k = 0; k < npass; k++) {
             unsigned dt = 0, endp = 0, slot, off;
             int r;
             if (xr_err) { ok = -4; break; }
-            cap_k = (capl && k < CAP_N) ? k : 0xffffffff;   // v154
-            if (cap_k < CAP_N) capl[k][4] = fr | 0x80000000u;
+            cap_k = capl ? k % CAP_N : 0xffffffff;   // v154 (v182: ring)
+            if (cap_k < CAP_N) { memset(capl[cap_k], 0, 20); capl[cap_k][4] = fr | 0x80000000u; }
             wb_mon(fr);   // v89i
             if ((fl & 0x2000000) && (kbd_is_key_pressed(KEY_SET) || kbd_is_key_pressed(KEY_SHOOT_HALF))) { slog("  REC stop key", 0, 0); break; }   // v56
             if (sh_on && sh_stop_req) { slog("  v160 REC stop (shell key)", 0, 0); break; }
@@ -4026,10 +4858,12 @@ static void lv_x3(void)
             if (lj_on && lj_err) { ok = -7; break; }
             if (lj_on ? ((int)(xr_prod - lj_cnt) >= (int)lj_raw_n) : (xr_prod - xr_wr >= xr_nslot)) {      // writer (v101: encoder) behind: drop this sensor frame
                 drops++; x_dr[0]++;
-                if (cap_k < CAP_N) { capl[k][0] = usec() | 0x80000000u; capl[k][3] = 0x0f000000u; }   // v154: drop (ring full)
+                xr_last_drop_ms = get_tick_count(); if (x_m1 && lj_on) xr_slot_cnt++;   // v183
+                if (cap_k < CAP_N) { capl[cap_k][0] = usec() | 0x80000000u; capl[cap_k][3] = 0x0f000000u; }   // v154: drop (ring full)
                 if (px_on && px_close() < 0) { ok = -1; break; }   // v73: no PACK32 on across an unarmed readout
                 if (lvn_sync == 4) { if (!wait_dfe_w(200, 0, x_hi, x_hi)) { ok = -1; break; } }   // v73: wait_eof needs the SIO CMOS bursts
                 else if (!wait_eof(200)) { ok = -1; break; }
+                if (wb_due) wb_kick_due(fr);   // v182 (A.1): a drop burst never reaches lvn_cap: kick now, during a readout that is not ours
                 if (lj_on && x_kick) {   // v137: catch-up. One kick per captured frame: a missed kick (writer slot busy) is never recovered, the backlog stays at the ring size -> drop bursts. We are now at the start of the frame we skip: its readout is not ours, let the encoder run through it.
                     unsigned u0c = usec(); int rc;
                     while ((rc = lj_collect()) == 0 && udiff(u0c, usec()) < 4000) ;   // must start now (~30 ms encode) to end before our next readout
@@ -4049,7 +4883,7 @@ static void lv_x3(void)
                 stg_k = 0; STG(0);
                 r = wait_eof(200) ? 1 : -1;
             } else
-            if (lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; x_early_fr = fr; }   // v121
+            if (lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; xr_drop_at[fr] = (unsigned short)(drops < 65535 ? drops : 65535); x_early_fr = fr; memset(TLF_ROW(fr), 0, 32); }   // v121 (v182: TLF ring row)
             lj_chased = 0;   // v144
             r = lvn_cap(buf + off, phys + off, lines, &dt, &endp);
             // v172b: an early kick proves this raw frame completed even if
@@ -4160,14 +4994,17 @@ static void lv_x3(void)
             if (!lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; }   // v167: in lj_on mode L3780 pre-capture timestamp stands
             if (xr_mlv && !lj_on) mlv_frame_hdr((unsigned char *)buf + slot * xr_stride, fr, xr_fb, (get_tick_count() - t0) * 1000);
             if (fr < 16) lm2.dt[fr] = dt;
-            fr++;
+            fr++; xr_slot_cnt++;   // v183
             xr_prod = fr;
             if (xr_prod - xr_wr > maxbl) maxbl = xr_prod - xr_wr;
             GiveSemaphore(xr_sem);
             if (lj_on) GiveSemaphore(lj_sem);
         }
         if (px_on && px_close() < 0 && ok > 0) ok = -1;   // v73: end / stop key / error: full release
-        slog_flush();   // v155: capture over, PACK32 released: write the deferred lines
+        wb_defer = 0; if (wb_due) wb_kick_due(k);   // v180f: never leave a kick pending
+        pv_rec_stop();   // v182: live preview task off before any EXMEM teardown
+        // v182 (A.3): the log stays deferred through the whole report (one card write at the end, below)
+        slog("  v180f wb kicks in readout=%d hi=%d", wb_late_n, x_hi);
         cap_n = k < CAP_N ? k : CAP_N; cap_k = 0xffffffff;   // v154
         if (!ts_stop()) { ok = -8; slog("v153 task drain timeout; EXMEM/module pinned", 0, 0); }
         if (lj_on && x_kick && !lj_err && !xr_err) lj_drain();   // v167: encode & enqueue any remaining tail frames before xr_stop
@@ -4180,10 +5017,18 @@ static void lv_x3(void)
             // semaphores and module resident; only a power cycle can recover.
             ts_pinned = 1;
             slog("v172b drain timeout: EXMEM/module pinned", 0, 0);
+            slog_flush();   // v182
             strcpy(msg, "Drain bloque: redemarrer boitier");
             return;
         }
         lm2.ndone = xr_wr;
+        if (xr_mlv && x_m1 && lj_on && fr > 1 && fr <= XR_MAX) {   // v183: 24.00p slot grid (drops count as slots)
+            unsigned span_ms = xr_tick[fr - 1] - xr_tick[0];
+            unsigned slots = (fr - 1) + ((unsigned)xr_drop_at[fr - 1] - (unsigned)xr_drop_at[0]);
+            unsigned per_us = (slots >= 10 && span_ms > 0) ? span_ms * 1000u / slots : 0;   // <= ~1.3e8: 32-bit safe
+            if (per_us >= 41200 && per_us <= 42100) mlv_fps1000 = 1000000000u / per_us;
+            else mlv_fps1000 = 1000000000u / (x_per ? x_per : 41666u);
+        } else
         if (xr_mlv && fr > 1 && fr <= XR_MAX && xr_tick[fr - 1] > xr_tick[0])   // v89r: real cadence (frame timestamps), e.g. 12.4 fps
             mlv_fps1000 = (fr - 1) * 1000000u / (xr_tick[fr - 1] - xr_tick[0]);
         if (xr_mlv) mlv_finalize(mlv_crop ? enc_w : x_w, mlv_crop ? enc_h : lines, lj_on ? 14 : lvn_bpp, lj_on);
@@ -4192,9 +5037,21 @@ static void lv_x3(void)
         if (fd >= 0) { write(fd, &fr, 4); write(fd, xr_tick, fr * 4); write(fd, xr_wus, fr * 4); close(fd); }
         if (!ts_pinned) ts_save();   // v153: no callback outstanding before SD export
         fd = open("A/M10CAP.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);   // v154: per-pass record (CAP1)
-        if (fd >= 0) { unsigned hd[4] = { 0x31504143, capl ? cap_n : 0, 5, 154 }; write(fd, hd, 16); if (capl && cap_n) write(fd, capl, cap_n * 20); close(fd); }
+        if (fd >= 0) {   // v182: ring -> chronological order (the last CAP_N passes); hd[3] = 182 when it wrapped
+            unsigned hd[4] = { 0x31504143, capl ? cap_n : 0, 5, k > CAP_N ? 182 : 154 }, c0 = k > CAP_N ? k % CAP_N : 0;
+            write(fd, hd, 16);
+            if (capl && cap_n) { write(fd, capl + c0, (cap_n - c0) * 20); if (c0) write(fd, capl, c0 * 20); }
+            close(fd);
+        }
         fd = open("A/M10TLF.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);   // v140: per-frame timeline
-        if (fd >= 0) { unsigned hd[4] = { 0x31464c54, fr < TLF_N ? fr : TLF_N, 8, x_he_n }; write(fd, hd, 16); write(fd, x_he_at, sizeof(x_he_at)); write(fd, tlf, (fr < TLF_N ? fr : TLF_N) * 32); close(fd); }
+        if (fd >= 0) {   // v182: TLF1 (rows = frames 0..n-1) or, once the ring wrapped, TLF2 = same layout + trailing u32 first frame
+            unsigned n = fr < TLF_N ? fr : TLF_N, f0 = fr > TLF_N ? fr - TLF_N : 0, r0 = f0 % TLF_N;
+            unsigned hd[4] = { f0 ? 0x32464c54 : 0x31464c54, n, 8, x_he_n };
+            write(fd, hd, 16); write(fd, x_he_at, sizeof(x_he_at));
+            write(fd, tlf[r0], (n - r0) * 32); if (r0) write(fd, tlf, r0 * 32);
+            if (f0) write(fd, &f0, 4);
+            close(fd);
+        }
         if (x_he_n) {                               // v148: every error, (frame << 8) | status, bit 7 = dropped
             fd = open("A/M10HE.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);
             if (fd >= 0) { unsigned hd[4] = { 0x31454856, x_he_n < HE_ALL_N ? x_he_n : HE_ALL_N, x_her, x_he_late }; write(fd, hd, 16); write(fd, x_he_all, (x_he_n < HE_ALL_N ? x_he_n : HE_ALL_N) * 4); close(fd); }
@@ -4216,7 +5073,10 @@ static void lv_x3(void)
             slog("  v101 enc us avg=%d max=%d", n ? usum / n : 0, umax);
             if (lj_err) slog("  v101 cb st=%x size=%d", cb_st, cb_size);
             for (i = 0; i < n && i < 24; i += 2) slog("  v105 ph %d %d", lj_ph[i], i + 1 < n ? lj_ph[i + 1] : 0);
-            enc_rd10 = 0; enc_no_snap = 0; enc_in_off = VID_IN_OFF; lj_on = 0; x_early = 0; lj_sem_p = 0; x_kick = 0;
+            slog("  v181 async kicks=%d raw=%d", lj_async_n, lj_raw_n);
+            { unsigned i; for (i = 0; i < 9; i += 3) { slog("  v181b rd1 +%02x %08x", 4 * i, enc_rdg[i]); slog("    %08x %08x", enc_rdg[i + 1], enc_rdg[i + 2]); } }
+            if (lvn_bpp == 12) eng_out(LL_UNPACK_REG, 0);   // v182: LL unpacker back to 10-bit (0) after a 12b take
+            enc_rd10 = 0; enc_rd12 = 0; enc_no_snap = 0; enc_in_off = VID_IN_OFF; lj_on = 0; x_early = 0; lj_sem_p = 0; x_kick = 0; x_poll = 0;
             if (lj_done) DeleteSemaphore(lj_sem);
         }
         slog("  v88 hs_n=%d", hs_n, 0);
@@ -4248,6 +5108,12 @@ static void lv_x3(void)
         slog("  v73 px opens=%d frames=%d", px_opens, px_frames);
         slog("  v73 late=%d rearm_err=%d", px_late, px_rearm_err);
         slog("  v73 pulses=%d short_bad=%d", px_pulses, x_short_bad);
+        slog("  v182 roll n=%d max ms=%d", xr_roll_n, xr_roll_ms);
+        slog("  v182 roll fr=%d drops_at_roll=%d", xr_roll_fr, xr_roll_drops);
+        slog("  v182 wb watchdog kicks=%d", wb_wd_kicks, 0);
+        slog("  v183 slots=%d t0=%d", xr_slot_cnt, xr_t0_ms);
+        slog("  v183 fps1000=%d drops=%d", mlv_fps1000, drops);
+        slog_flush();   // v182 (A.3): single card write of the capture + report lines
         if (xr_done) DeleteSemaphore(xr_sem);
         if (!ts_pinned) { ts_buf = 0; ts_names = 0; capl = 0; cap_k = 0xffffffff; exmem_free_uncached(EXMEM_TYPE); }
         if (ts_pinned) strcpy(msg, "TSK pinned: do not reload");
@@ -4259,9 +5125,9 @@ static void lv_x3(void)
             if (fd2 >= 0) { write(fd2, &wr_n, 4); write(fd2, wr_log, sizeof(wr_log)); close(fd2); }
             slog("  v89o wr_n=%d", wr_n, 0);
         }
-        if (ok != -5) for (i = 0; i < 8; i++) {   // v89m: frozen chain -> return at once (host re-commits); v89k: keep the WB watchdog running after REC (r100w_0 died here, 3 s after a burst stop)
+        if (ok != -5 && !sh_on) for (i = 0; i < 8; i++) {   // v89m: frozen chain -> return at once (host re-commits); v89k: keep the WB watchdog running after REC (r100w_0 died here, 3 s after a burst stop); v182: skipped in the shell
             unsigned j;
-            for (j = 0; j < 5; j++) { msleep(50); if (x_he_n) wb_mon(fr); }
+            for (j = 0; j < 5; j++) { msleep(50); if (x_he_n || x_m1) wb_mon(fr); }   // v182: m1 too (WBInteg starves without a head error)
             slog("  hb tg=%d 6804=%08x", *(volatile unsigned *)0x0000e664, shamem(0xc0f06804));
         }
         if (x_he_n && ok != -5) { unsigned j; for (j = 0; j < 80; j++) { msleep(50); wb_mon(fr); } slog("  v89k post kicks=%d", wb_kick_n, 0); }   // 4 s more: until WBInteg is fed again
@@ -4426,7 +5292,7 @@ static void lv_x3(void)
         if (enc_rd10) slog("  v98 prec=%d jpn=%d", enc_prec, x_jpn);
         { unsigned i; for (i = 0; i < x_jpn; i++) slog("  v99 jp %x=%x", x_jpo[i], x_jpv[i]); }
         hdr[0] = 0x434e4532; hdr[1] = sz; hdr[2] = eus; hdr[3] = cb_st; hdr[4] = cb_size; hdr[5] = x_enc; hdr[6] = lines; hdr[7] = enc_w;
-        enc_in_off = VID_IN_OFF; enc_rd10 = 0;
+        enc_in_off = VID_IN_OFF; enc_rd10 = 0; enc_rd12 = 0;
         fd = open("A/M10LL.BIN", O_WRONLY | O_CREAT | O_TRUNC, 0777);
         if (fd >= 0) { write(fd, hdr, sizeof(hdr)); if (sz && sz <= enc_out_size) write(fd, buf + enc_out_off, sz); close(fd); }
         enc_bits = 2;
@@ -4442,6 +5308,7 @@ static void lv_x3(void)
     idle_polls = 20; lvn_post_ms = 0; tl_step = 1000; lvm_sleep = 1; lvn_sync = 0;
     sprintf(msg, "LVX3 %d/%d %s", (int)lm2.ndone, (int)npass, ok > 0 ? "ok" : (ok == 0 ? "STALL" : (ok == -2 ? "LV perdue" : "err")));
     slog("v26 LVX3 done ok=%d", ok, 0);
+    slog("  v179 trg done=%d us=%d", x_trg_done, x_trg_us); slog("  v179 trg busy=%d skip=%d", trg_busy, trg_skip);
     lvn_bpp = 14; lvn_lb = LVN_LB;
     for (i = 0; i < 12; i++) {
         unsigned q;
@@ -4459,6 +5326,7 @@ static void lv_x3(void)
 
 // ---- module plumbing (simple tool, runs once from the Tools menu) ----
 static volatile int task_running = 0;
+static volatile int run_async = 0;   // v181c: A/M10RUN.ASY -> _run returns at once, A/M10X3.END written at the end
 
 static void cine_task(void)
 {
@@ -4468,6 +5336,7 @@ static void cine_task(void)
     if (fx >= 0) close(fx);
     int fz = open("A/M10Z.CFG", O_RDONLY, 0777);   // v156: marker file -> lv_x3 also in the x5 magnifier
     if (fz >= 0) close(fz);
+    if (!sh_on && *(volatile unsigned *)0x865c == 1) wb_wd_start();   // v182 (A.5-1): ImgMode 1 take driven by M10M1.LUA
     if (zoom_head(h) && fz >= 0 && fx >= 0 && *(volatile unsigned *)DSS_FLAGS != 0) lv_x3();   // v168z: tall zoom too
     else if (h != 0 && *(volatile unsigned *)DSS_FLAGS != 0 && h != 0x045702a6 && ((h >> 16) == 0x4a6 || fx >= 0))
         lv_x3();                    // v25: Film / 1x3 (head 1190 lines), v27: any head if A/M10X3.CFG
@@ -4475,6 +5344,12 @@ static void cine_task(void)
         lv_multi2();                // v24 (v23: lv_watch, v18-22: lv_multi2)
     else
         grab();
+    if (run_async) {   // v181c: stand-alone Lua (kbd task free during the take): end marker for the script
+        int fe = open("A/M10X3.END", O_WRONLY | O_CREAT | O_TRUNC, 0777);
+        if (fe >= 0) { write(fe, msg, strlen(msg)); close(fe); }
+        run_async = 0;
+    }
+    wb_wd_end();   // v182: the Lua kicks again once it has seen A/M10X3.END
     task_running = 0;
     ExitTask();
 }
@@ -4494,16 +5369,16 @@ static void cine_task(void)
 #define SH_REC46    0xfc73045c
 #define SH_FLD46    0xfc7308e8
 #define SH_CACHE41  (0x575b0 + 36 * 41)
-#define FN_DCLEAN   0xfc1267cb
 #define FN_IINVAL   0xfc126871
 #define SH_NENT     4096
 #define SH_PHYSW2   (0x00056bec + 8)  // physw_status[2] (stubs_entry 110d)
 #define SH_USBMASK  0x10000000       // USB power (platform_kbd.h USB_MASK)
-static int sh_usb(void) { return (*(volatile unsigned *)SH_PHYSW2 & SH_USBMASK) != 0; }
+static int sh_usb_ok = 0;   // v182: A/M10USB.OK present -> desk test with USB plugged in
+static int sh_usb(void) { return !sh_usb_ok && (*(volatile unsigned *)SH_PHYSW2 & SH_USBMASK) != 0; }
 static char *sh_hook = 0, *sh_stub = 0, *sh_rec = 0;
 static unsigned sh_take = 0, sh_key = KEY_VIDEO, sh_frames = 0;
 static char sh_line[64], sh_l1[48], sh_l2[64];
-static volatile unsigned sh_dirty = 1, sh_quit = 0, sh_rec_on = 0;
+static volatile unsigned sh_dirty = 1, sh_quit = 0;
 static unsigned sh_t_redraw = 0;
 static void sh_say(const char *s1, const char *s2)   // v174: transient message (centre toast), drawn by sh_hud
 {
@@ -4554,19 +5429,45 @@ static void sh_poke(unsigned a, unsigned v);
 extern unsigned long get_batt_perc(void);
 static unsigned sh_gray(unsigned b) { return b ^ (b >> 1); }
 static void sh_hook_w(unsigned off, unsigned v) { if (sh_hook) sh_poke((unsigned)sh_hook + off, v); }
+static int sh_x3_ok_now(void);
+#define SH_M1_ISO_DEF 4      // v182: ImgMode 1 has no Canon AE path: ISO 800 (CMOS 0 = 0x6f) when the field says AUTO
+#define SH_M1_TV_DEF  2      // v182: 1/48 (180 degrees at 24p)
+#define SH_M1_LCLK    732
+static unsigned sh_m1_iso(void) { return sh_iso_i ? sh_iso_i : SH_M1_ISO_DEF; }
+static unsigned sh_m1_tv(void) { return sh_tv_i ? sh_tv_i : SH_M1_TV_DEF; }
 static void sh_expo_apply(void)
 {
-    unsigned i;
+    unsigned i, tv = sh_tv_i;
     if (!sh_hook || *(volatile unsigned *)((unsigned)sh_hook + 0x200) != 0x364f4953) return;   // v6 only
+    if (sh_prof()->kind == SH_M1) {   // v182 (C.2): ImgMode 1 overrides = M10M1.LUA switch_m1 (CMOS 0/5/7, TG 8006/805f/8061)
+        if (sh_prof()->m1_wide) {   // v185: wide ImgMode 1 window (CMOS 2 / 5 / 7)
+            sh_hook_w(0x240 + 4 * 2, 0x10000 | 0x742);
+            sh_hook_w(0x240 + 4 * 5, 0x10000 | 0x020);
+            sh_hook_w(0x240 + 4 * 7, 0x10000 | (sh_m1_h() > 1440 ? 0xac6 : 0xae9));
+        } else {
+            sh_hook_w(0x240 + 4 * 2, 0);
+            sh_hook_w(0x240 + 4 * 5, 0x10000 | 0x300);
+            sh_hook_w(0x240 + 4 * 7, 0x10000 | 0xae9);
+        }
+        sh_hook_w(0x240, 0x10000 | sh_iso_c[sh_m1_iso()]);
+        sh_hook_w(0x200 + 20, 1);
+        tv = sh_m1_tv();
+    } else {
     // ISO: CMOS reg 0
     if (sh_iso_i) { sh_hook_w(0x240, 0x10000 | sh_iso_c[sh_iso_i]); sh_hook_w(0x200 + 20, 1); }
-    else { sh_hook_w(0x240, 0); sh_hook_w(0x200 + 20, 0); }
-    // Tv: TG 805f / 8061 end line
+    else { sh_hook_w(0x240, 0); sh_hook_w(0x200 + 20, sh_prof()->kind == SH_X3 && sh_x3_ok_now() ? 1 : 0); }   // v178: CMOS 7 override stays on in 1x3
+    sh_hook_w(0x240 + 4 * 2, 0);                                                              // v185: CMOS 2 (wide ImgMode 1) never outside it
+    sh_hook_w(0x240 + 4 * 5, 0);                                                              // v182: ImgMode 1 CMOS 5 never outside it
+    if (!(sh_prof()->kind == SH_X3 && sh_x3_ok_now())) sh_hook_w(0x240 + 4 * 7, 0);           // v182: CMOS 7 only for 1x3 (0x140) / ImgMode 1 (0xae9)
+    if ((*(volatile unsigned *)((unsigned)sh_hook + 0x308) >> 16) == 0x8006) { sh_hook_w(0x308, 0); sh_hook_w(0x408, 0); }   // v182: stale ImgMode 1 line clock
+    }
+    // Tv: TG 805f / 8061 end line (entries 0 and 1; v182: entry 2 belongs to 8006 / 800c, never cleared here)
     sh_hook_w(0x200 + 28, 0); sh_hook_w(0x200 + 44, 0);
-    for (i = 0; i < 4; i++) { sh_hook_w(0x400 + 4 * i, 0); sh_hook_w(0x300 + 4 * i, 0); }
-    if (sh_tv_i) {
+    for (i = 0; i < 2; i++) { sh_hook_w(0x400 + 4 * i, 0); sh_hook_w(0x300 + 4 * i, 0); }
+    if (sh_prof()->kind == SH_M1) { sh_hook_w(0x408, 0); sh_hook_w(0x308, (0x8006u << 16) | sh_gray(sh_m1_lclk())); }   // v182: line clock 732 (0x03b2)
+    if (tv) {
         const sh_prof_t *pr = sh_prof();
-        unsigned fl = pr->fl, us = 1000000u / sh_tv_d[sh_tv_i], lines = us * fl / pr->per, end;
+        unsigned fl = pr->fl, us = 1000000u / sh_tv_d[tv], lines = us * fl / pr->per, end;
         if (lines > fl - 40) lines = fl - 40;          // keep a margin before the next readout
         if (lines < 2) lines = 2;
         end = fl - lines;
@@ -4595,12 +5496,21 @@ static void sh_expo_off(void)
 #define SH_NFIELD 6
 static volatile unsigned sh_field = 0, sh_hud_drawn = 0;
 static unsigned sh_toast_t = 0, sh_rec_t0 = 0;
-#define SH_C_BAR   MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_WHITE)
+// v182 (B.3): in ImgMode 1 every HUD background is OPAQUE black (the 50 % grey let Canon's colour bars through)
+static unsigned sh_bg(void) { return sh_is_m1() ? COLOR_BLACK : COLOR_GREY_DK_TRANS; }
+#define SH_C_BAR   MAKE_COLOR(sh_bg(), COLOR_WHITE)
 #define SH_C_SEL   MAKE_COLOR(COLOR_WHITE, COLOR_BLACK)
-#define SH_C_DIM   MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_LT)
+#define SH_C_DIM   MAKE_COLOR(sh_bg(), COLOR_GREY_LT)
 static void sh_hud_clear(void)
 {
     unsigned y;
+    if (!pv_ok()) { sh_hud_drawn = 0; return; }
+    if (sh_is_m1()) {   // v182: never transparent in ImgMode 1 (bars black, centre = mask)
+        pv_fill(0, 20, 0, PV_BW, PV_BLACK); pv_fill(220, 240, 0, PV_BW, PV_BLACK);
+        pv_m1_mask(1);
+        sh_hud_drawn = 0;
+        return;
+    }
     for (y = 0; y < 20; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
     for (y = 240 - 20; y < 240; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
     for (y = 100; y < 140; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);
@@ -4612,66 +5522,73 @@ static void sh_hud(int force)
 {
     const sh_prof_t *pr = sh_prof();
     char s[48], tv[12];
-    unsigned kb = GetFreeCardSpaceKb(), mbps, mins, x, pct;
+    unsigned kb, mbps, mins, x, pct, bg = sh_bg(), m1 = sh_is_m1();
     if (!force && sh_hud_drawn && get_tick_count() - sh_t_redraw < 500) return;
+    if (!pv_ok()) return;                                                          // v182: HDMI (480 wide): no CHDK layer writes
+    kb = GetFreeCardSpaceKb();
     sh_t_redraw = get_tick_count(); sh_hud_drawn = 1;
     // top bar
-    draw_rectangle(0, 0, 359, 19, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+    draw_rectangle(0, 0, 359, 19, MAKE_COLOR(bg, bg), RECT_BORDER0 | DRAW_FILLED);
     if (sh_rec_on) {
         unsigned sec = (get_tick_count() - sh_rec_t0) / 1000;
         draw_rectangle(4, 5, 13, 14, MAKE_COLOR(COLOR_RED, COLOR_RED), RECT_BORDER0 | DRAW_FILLED);
         sprintf(s, "%02u:%02u", sec / 60, sec % 60);
-        draw_string(18, 2, s, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_RED));
+        draw_string(18, 2, s, MAKE_COLOR(bg, COLOR_RED));
     } else draw_string(4, 2, "M10", SH_C_DIM);
-    sprintf(s, "%s%s", pr->tag, pr->fps != sh_armed_fps ? "*" : "");
+    sprintf(s, "%s%s", pr->tag, pr->kind == SH_X3 ? (sh_x3_ok ? "" : "*") : pr->kind == SH_M1 ? (sh_m1_ok ? "" : "*") : (pr->fps != sh_armed_fps ? "*" : ""));
     draw_string(180 - (int)strlen(s) * 4, 2, s, SH_C_BAR);
-    mbps = pr->bpp == 14 ? 56 : 45;                          // measured MB/s (LJ92, typical scene)
+    mbps = pr->kind == SH_M1 ? (pr->bpp == 12 ? 68 : 60) : pr->bpp == 14 ? 56 : pr->bpp == 12 ? 54 : 45;   // measured MB/s (LJ92, typical scene; 1440p: 2.5 / 2.8 MiB x 24)
     mins = (kb >> 10) / mbps / 60;
     sprintf(s, "%umin", mins);
-    draw_string(300 - (int)strlen(s) * 8, 2, s, mins < 3 ? MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_RED) : SH_C_BAR);
+    draw_string(300 - (int)strlen(s) * 8, 2, s, mins < 3 ? MAKE_COLOR(bg, COLOR_RED) : SH_C_BAR);
     pct = get_batt_perc();
-    draw_rectangle(310, 5, 349, 14, MAKE_COLOR(COLOR_TRANSPARENT, COLOR_WHITE), RECT_BORDER1);
+    draw_rectangle(310, 5, 349, 14, MAKE_COLOR(m1 ? COLOR_BLACK : COLOR_TRANSPARENT, COLOR_WHITE), RECT_BORDER1 | (m1 ? DRAW_FILLED : 0));
     draw_rectangle(350, 8, 352, 11, MAKE_COLOR(COLOR_WHITE, COLOR_WHITE), RECT_BORDER0 | DRAW_FILLED);
     x = 311 + 37 * (pct > 100 ? 100 : pct) / 100;
     if (x > 311) draw_rectangle(311, 6, x, 13, MAKE_COLOR(pct < 20 ? COLOR_RED : COLOR_WHITE, pct < 20 ? COLOR_RED : COLOR_WHITE), RECT_BORDER0 | DRAW_FILLED);
     // bottom bar: hidden during a take (nothing to change)
-    draw_rectangle(0, 220, 359, 239, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+    draw_rectangle(0, 220, 359, 239, MAKE_COLOR(bg, bg), RECT_BORDER0 | DRAW_FILLED);
     if (!sh_rec_on) {
         static const int fx[SH_NFIELD] = { 4, 80, 140, 200, 262, 312 };
         unsigned f;
         for (f = 0; f < SH_NFIELD; f++) {
             switch (f) {
-            case 0: if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO"); break;
-            case 1: sh_fmt_tv(tv, sh_tv_i); strcpy(s, tv); break;
+            case 0: if (m1) sprintf(s, "ISO %u", sh_iso_v[sh_m1_iso()]); else if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO"); break;
+            case 1: sh_fmt_tv(tv, m1 ? sh_m1_tv() : sh_tv_i); strcpy(s, tv); break;
             case 2: sh_fmt_av(s); break;
-            case 3: sprintf(s, "%u/%ub", pr->fps, pr->bpp); break;
-            case 4: strcpy(s, pv_zebra ? "ZEB" : "zeb"); break;
-            default: strcpy(s, pv_full ? "PLEIN" : "VIGN"); break;
+            case 3: if (pr->kind == SH_X3) sprintf(s, "1x3/%ub", pr->bpp); else if (m1) sprintf(s, "1440/%ub", pr->bpp); else sprintf(s, "%u/%ub", pr->fps, pr->bpp); break;
+            case 4: strcpy(s, pv_zebra ? (pv_peak ? "Z+P" : "ZEB") : (pv_peak ? "PK" : "---")); break;   // v183
+            default: if (m1) strcpy(s, pv_mode == 0 ? (sh_m1_wide() ? "WIDE" : "4:3") : pv_mode == 1 ? "1:1" : "OFF"); else strcpy(s, pv_full ? "PLEIN" : "VIGN"); break;
             }
             draw_string(fx[f], 222, s, f == sh_field ? SH_C_SEL : SH_C_BAR);
         }
     } else {
-        sprintf(s, "%s  %s  %s", sh_iso_i ? "" : "", "", "");
-        if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO");
+        if (m1) sprintf(s, "ISO %u", sh_iso_v[sh_m1_iso()]); else if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO");
         draw_string(4, 222, s, SH_C_DIM);
-        sh_fmt_tv(tv, sh_tv_i); draw_string(80, 222, tv, SH_C_DIM);
+        sh_fmt_tv(tv, m1 ? sh_m1_tv() : sh_tv_i); draw_string(80, 222, tv, SH_C_DIM);
         sh_fmt_av(tv); draw_string(140, 222, tv, SH_C_DIM);
         draw_string(250, 222, "REC = stop", SH_C_DIM);
     }
-    // zebra clip readout next to the thumbnail
-    if (sh_pv && pv_clip_pct) { sprintf(s, "%u%%", pv_clip_pct); draw_string(PV_X, PV_Y - 17 < 20 ? 22 : PV_Y - 17, s, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_YELLOW)); }
+    // zebra clip readout next to the thumbnail (v182: ImgMode 1 = top left of the image, opaque)
+    if ((sh_pv || (m1 && sh_rec_on)) && pv_clip_pct) {
+        sprintf(s, "%u%%", pv_clip_pct);
+        if (m1) draw_string(2, 22, s, MAKE_COLOR(COLOR_BLACK, COLOR_YELLOW));
+        else draw_string(PV_X, PV_Y - 17 < 20 ? 22 : PV_Y - 17, s, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_YELLOW));
+    }
     // toast (centre, 2 s)
     if (sh_dirty) { sh_dirty = 0; sh_toast_t = get_tick_count(); }
     if (sh_l1[0] && get_tick_count() - sh_toast_t < 2000) {
         unsigned w = strlen(sh_l1) > strlen(sh_l2) ? strlen(sh_l1) : strlen(sh_l2);
         int x0 = 180 - (int)w * 4 - 6;
-        draw_rectangle(x0, 102, 360 - x0, sh_l2[0] ? 138 : 120, MAKE_COLOR(COLOR_GREY_DK_TRANS, COLOR_GREY_DK_TRANS), RECT_BORDER0 | DRAW_FILLED);
+        if (x0 < 0) x0 = 0;
+        draw_rectangle(x0, 102, 359 - x0, sh_l2[0] ? 138 : 120, MAKE_COLOR(bg, bg), RECT_BORDER0 | DRAW_FILLED);
         draw_string(180 - (int)strlen(sh_l1) * 4, 103, sh_l1, SH_C_BAR);
         if (sh_l2[0]) draw_string(180 - (int)strlen(sh_l2) * 4, 121, sh_l2, SH_C_DIM);
     } else if (sh_l1[0]) {
         unsigned y;
         sh_l1[0] = 0;
-        for (y = 100; y < 140; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);   // under the toast only
+        if (m1) pv_fill(100, 140, 0, PV_BW, PV_BLACK);                            // v182: back to the opaque mask (the next render refills the image)
+        else for (y = 100; y < 140; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4);   // under the toast only
         if (sh_pv) sh_t_redraw = 0;
     }
     vid_bitmap_refresh();
@@ -4687,7 +5604,8 @@ static void sh_redraw(int force)   // v174: CHDK gui task entry point: HUD only,
     if (sh_pv && !force) return;                     // preview loop draws the HUD itself
     sh_hud(force);
 }
-static int sh_kbd(void) { return sh_on ? 1 : 0; }   // v161: 1 = masked keys (REC, SET, MENU, arrows, shutter) never reach Canon; touch is not masked
+static volatile unsigned sh_lua_wait = 0;   // v178c: while set, CHDK's kbd task reaches action_stack_process_all (Lua script runs)
+static int sh_kbd(void) { return (sh_on && !sh_lua_wait) ? 1 : 0; }   // v161: 1 = masked keys (REC, SET, MENU, arrows, shutter) never reach Canon; touch is not masked
 static gui_handler sh_gui = { GUI_MODE_MODULE, sh_redraw, sh_kbd, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 static gui_handler *sh_prev_gui = 0;
 static void sh_gui_assert(void) { if (sh_on && camera_info.state.gui_mode != GUI_MODE_MODULE) { gui_handler *o = gui_set_mode(&sh_gui); if (!sh_prev_gui && o != &sh_gui) sh_prev_gui = o; } }
@@ -4737,6 +5655,7 @@ static int sh_install_trap(void)
 static int sh_arm_fps(const sh_prof_t *pr, int update_cache)   // = m10zfps.py arm <fl> cache fld (live116)
 {
     unsigned cur = *(volatile unsigned *)(SH_TGTAB + 4 * 46), per = pr->per;
+    if (pr->kind != SH_X5) return 1;   /* v178: 1x3 leaves table 46 / sh_armed_fps alone (armed from PLAY at the REC key, sh_x3_arm); v182: ImgMode 1 has its own tables (sh_m1_arm_tables) */
     if (cur != (unsigned)sh_rec) {
         if (*(volatile unsigned short *)SH_REC46 != 732 || *(volatile unsigned short *)(SH_REC46 + 0xc) != 1456 || *(volatile unsigned *)(SH_REC46 + 0xc8) != 33306) return 0;
         if (*(volatile unsigned *)SH_FLD46 != 33306 || *(volatile unsigned *)(SH_FLD46 + 0x14) != 31979) return 0;
@@ -4774,6 +5693,13 @@ static int sh_handle_nav(int zoom)   // v174: UP/DOWN = field, LEFT/RIGHT = valu
     if (edge & 4) { sh_field = (sh_field + SH_NFIELD - 1) % SH_NFIELD; return 1; }
     if (edge & 8) { sh_field = (sh_field + 1) % SH_NFIELD; return 1; }
     d = (edge & 2) ? 1 : -1;
+    if (sh_is_m1() && (sh_field == 0 || sh_field == 1)) {   // v182: ImgMode 1: no AUTO (no Canon AE on that path), wrap 1..N-1
+        unsigned n = sh_field ? SH_NTV : SH_NISO, i = sh_field ? sh_m1_tv() : sh_m1_iso();
+        i = (i - 1 + (n - 1) + d) % (n - 1) + 1;
+        if (sh_field) sh_tv_i = i; else sh_iso_i = i;
+        sh_expo_apply();
+        return 1;
+    }
     switch (sh_field) {
     case 0: sh_iso_i = (sh_iso_i + SH_NISO + d) % SH_NISO; sh_expo_apply(); break;
     case 1: sh_tv_i = (sh_tv_i + SH_NTV + d) % SH_NTV; sh_expo_apply(); break;
@@ -4786,14 +5712,27 @@ static int sh_handle_nav(int zoom)   // v174: UP/DOWN = field, LEFT/RIGHT = valu
         sh_av_apply();
         break;
     }
-    case 3:
+    case 3: {
+        unsigned k0 = sh_prof()->kind;
         sh_prof_idx = (sh_prof_idx + SH_NPROF + d) % SH_NPROF;
+        if (sh_prof()->kind != SH_X3 && k0 == SH_X3) { sh_x3_ok = 0; sh_hook_w(0x240 + 4 * 7, 0); }   // v178: leaving 1x3 drops its CMOS 7 override
+        if ((k0 == SH_M1) != (sh_prof()->kind == SH_M1)) { ret = 2; break; }   // v182: into / out of ImgMode 1: shell_task switches (Lua IPC, tables)
         sh_arm_fps(sh_prof(), !zoom);
         sh_expo_apply();                                  // Tv lines depend on the frame length
-        if (zoom && sh_prof()->fps != sh_armed_fps) sh_say("CADENCE: SORTIR/RENTRER x5", 0);
+        if (zoom && sh_prof()->kind == SH_X5 && sh_prof()->fps != sh_armed_fps) sh_say("CADENCE: SORTIR/RENTRER x5", 0);
+        if (sh_prof()->kind == SH_X3) sh_say("1x3 25p 12b", "REC = armer");
         break;
-    case 4: pv_zebra = !pv_zebra; break;
-    default: pv_full = !pv_full; ret = 2; break;
+    }
+    case 4: {   // v183: Z+P -> PK -> ZEB -> --- (m = zebra | peak << 1, idx = 3 - m)
+        unsigned m = (pv_zebra ? 1u : 0u) | (pv_peak ? 2u : 0u), idx = 3u - m;
+        idx = (idx + 4u + (unsigned)d) & 3u; m = 3u - idx;
+        pv_zebra = m & 1u; pv_peak = (m >> 1) & 1u;
+        break;
+    }
+    default:
+        if (sh_is_m1()) pv_mode = (pv_mode + 3 + d) % 3;  // v182: 4:3 / 1:1 / OFF
+        else pv_full = !pv_full;
+        ret = 2; break;
     }
     return ret;
 }
@@ -4811,8 +5750,12 @@ static int sh_next_take(void)   // first free A/M10_NNNN.MLV
 }
 static int sh_key_down(void) { return kbd_is_key_pressed(sh_key); }
 static void sh_wait_release(void) { unsigned t = get_tick_count(); while (sh_key_down() && get_tick_count() - t < 3000) msleep(20); }
+static void sh_x3_restore_ptr(void);
+static void sh_m1_restore_tables(void);
 static void sh_uninstall(void)   // v162: hand the camera back to Canon (USB plugged / quit)
 {
+    sh_m1_restore_tables();
+    sh_x3_restore_ptr();
     if (sh_rec && *(volatile unsigned *)(SH_TGTAB + 4 * 46) == (unsigned)sh_rec) {
         sh_poke(SH_TGTAB + 4 * 46, SH_REC46);
         sh_poke(SH_TGTAB + 0xe4 + 4 * 46, SH_FLD46);
@@ -4823,29 +5766,453 @@ static void sh_uninstall(void)   // v162: hand the camera back to Canon (USB plu
     if (sh_hook && *(volatile unsigned *)SH_PTR == (((unsigned)sh_hook + 0x10) | 1)) sh_poke(SH_PTR, SH_ORIG);   // poke32 runs from the hook code itself, still in RAM
     sh_hook = 0;
 }
+
+// ---------------------------------------------------------------------------
+// v182 (spec C.2/C.3): ImgMode 1 (1920x1440 1:1) RAM tables, power lock, and
+// filesystem-free RAM IPC with M10SHELL.LUA (siohook6 header +0x220 / +0x224).
+// ---------------------------------------------------------------------------
+#define FN_LOCK_PWR    0xfc1fb48d   // LockMainPower (1.10d stubs_entry.S)
+#define FN_UNLOCK_PWR  0xfc1fb425   // UnlockMainPower (1.10d stubs_entry.S)
+#define SH_M1_TAB_EX   0x2cd24
+#define SH_M1_SLOT_EX  3
+#define SH_M1_REC_EX   0xfc72f27c
+#define SH_M1_EX_SZ    0x68
+#define SH_M1_DRV      9
+#define SH_M1_ROMREC   0xfc72fd0c
+#define SH_M1_TG_SZ    0xd0
+#define SH_M1_FLD_SZ   0x2c
+#define SH_M1_CACHE1   (0x575b0 + 36 * 1)
+#define SH_M1_X0       0x34
+#define SH_M1_Y0       32
+#define SH_M1_W        1920
+#define SH_M1_HEAD_H   1456
+#define SH_M1_FL       1819
+#define SH_M1_PER      41666
+#define SH_M1_FC3C_VAL ((7058 - 2 * SH_M1_HEAD_H) / 2)   // 2073
+#define SH_IPC_REQ_OFF 0x220
+#define SH_IPC_ACK_OFF 0x224
+#define SH_IPC_ARG_OFF 0x280   // v185: siohook6 pad, C -> Lua argument ([0xfc3c] for m1_on)
+#define SH_IPC_M1_ON   1
+#define SH_IPC_M1_OFF  2
+#define SH_IPC_REC     3
+#define SH_IPC_PLAY    4
+#define SH_IPC_AF      5   // v183: one-shot Canon hybrid AF (Lua: ImgMode 1 off, AF, back)
+#define SH_IPC_END     0xE0
+
+static char *sh_m1_ex = 0, *sh_m1_tg = 0, *sh_m1_fld = 0;
+static unsigned sh_m1_orig_fld = 0, sh_m1_orig_cache[9], sh_m1_fc3c0 = 0;
+static int sh_m1_patched = 0, sh_m1_fc3c_saved = 0, sh_pwr_locked = 0;
+
+static void sh_pwr_lock(int lock)
+{
+    if (lock && !sh_pwr_locked) {
+        ((fn0)FN_LOCK_PWR)();
+        ((fn1)0xfc1fb4dd)(0);   // v184c: SetAutoShutdownTime(0) (1.10d stubs_entry.S): no Display-Off / idle timer
+        sh_pwr_locked = 1;
+    }
+    else if (!lock && sh_pwr_locked) { ((fn0)FN_UNLOCK_PWR)(); sh_pwr_locked = 0; }
+}
+
+static int sh_ipc_req(unsigned code, unsigned ms)   // v182 (C.3): RAM mailbox in siohook6 (+0x220 req, +0x224 ack)
+{
+    unsigned t = get_tick_count(), ack = 0;
+    if (!sh_hook || *(volatile unsigned *)((unsigned)sh_hook + 0x200) != 0x364f4953) return 0;
+    sh_hook_w(SH_IPC_ACK_OFF, 0);
+    sh_lua_wait = 1;                                          // let CHDK kbd_task run the Lua script
+    sh_hook_w(SH_IPC_REQ_OFF, code);
+    slog("v182 ipc req=%x", code, 0);
+    while (get_tick_count() - t < ms) {
+        ack = *(volatile unsigned *)((unsigned)sh_hook + SH_IPC_ACK_OFF);
+        if ((ack & 0x1ffu) == (code | 0x100u)) {
+            sh_lua_wait = 0;
+            slog("v182 ipc ack=%08x ms=%d", ack, get_tick_count() - t);
+            return (code == SH_IPC_END) ? 1 : (int)((ack >> 9) & 1u);
+        }
+        msleep(50);
+    }
+    sh_hook_w(SH_IPC_REQ_OFF, 0);
+    sh_lua_wait = 0;
+    slog("v182 ipc timeout req=%x", code, 0);
+    return 0;
+}
+
+static int sh_m1_arm_tables(void)   // v182 (C.2): RAM copies of Extract[3], TgPixelRes[9], FldSpec[9], cache[1]
+{
+    unsigned W = sh_m1_w(), HH = sh_m1_head_h(), X0 = sh_m1_x0(), LC = sh_m1_lclk(), FL = sh_m1_fl(), PER = sh_m1_per();   // v185
+    unsigned i, x1 = X0 + W / 4, y1 = SH_M1_Y0 + HH - 1;
+    unsigned ll = (LC << 16) | LC, fld_delta;
+    if (!sh_m1_patched) {
+        unsigned cur_ex = *(volatile unsigned *)(SH_M1_TAB_EX + 4 * SH_M1_SLOT_EX);
+        unsigned cur_tg = *(volatile unsigned *)(SH_TGTAB + 4 * SH_M1_DRV);
+        if (cur_ex != SH_M1_REC_EX || cur_tg != SH_M1_ROMREC) {
+            slog("v182 m1 tables unexpected ex=%08x tg=%08x", cur_ex, cur_tg);
+            return 0;
+        }
+        sh_m1_orig_fld = *(volatile unsigned *)(SH_TGTAB + 0xe4 + 4 * SH_M1_DRV);
+        for (i = 0; i < 9; i++) sh_m1_orig_cache[i] = *(volatile unsigned *)(SH_M1_CACHE1 + 4 * i);
+    }
+    if (!sh_m1_fc3c_saved) { sh_m1_fc3c0 = *(volatile unsigned *)0xfc3c; sh_m1_fc3c_saved = 1; }
+    if (!sh_m1_ex) {
+        unsigned b = (unsigned)malloc(SH_M1_EX_SZ + 32);
+        if (!b) return 0;
+        sh_m1_ex = (char *)((b + 15) & ~15u);
+    }
+    if (!sh_m1_tg) {
+        unsigned b = (unsigned)malloc(SH_M1_TG_SZ + SH_M1_FLD_SZ + 64);
+        if (!b) return 0;
+        sh_m1_tg = (char *)((b + 15) & ~15u);
+        sh_m1_fld = sh_m1_tg + SH_M1_TG_SZ + 16;
+    }
+    memcpy(sh_m1_ex, (void *)SH_M1_REC_EX, SH_M1_EX_SZ);
+    *(unsigned *)(sh_m1_ex + 0x0c) = W;      *(unsigned *)(sh_m1_ex + 0x10) = HH;
+    *(unsigned *)(sh_m1_ex + 0x14) = W;      *(unsigned *)(sh_m1_ex + 0x18) = HH;
+    *(unsigned *)(sh_m1_ex + 0x24) = x1;           *(unsigned *)(sh_m1_ex + 0x28) = y1;
+    *(unsigned *)(sh_m1_ex + 0x2c) = X0;     *(unsigned *)(sh_m1_ex + 0x30) = SH_M1_Y0;
+
+    memcpy(sh_m1_tg, (void *)SH_M1_ROMREC, SH_M1_TG_SZ);
+    *(unsigned *)(sh_m1_tg + 0x00) = ll;           *(unsigned *)(sh_m1_tg + 0x04) = ll;
+    *(unsigned *)(sh_m1_tg + 0x08) = LC;
+    *(unsigned *)(sh_m1_tg + 0x0c) = FL;     *(unsigned *)(sh_m1_tg + 0x10) = FL;
+    *(unsigned *)(sh_m1_tg + 0x80) = 0x10000u + (FL - 42);
+    *(unsigned *)(sh_m1_tg + 0xc8) = PER;
+
+    memcpy(sh_m1_fld, (void *)sh_m1_orig_fld, SH_M1_FLD_SZ);
+    fld_delta = *(volatile unsigned *)sh_m1_orig_fld - *(volatile unsigned *)(sh_m1_orig_fld + 0x14);
+    *(unsigned *)(sh_m1_fld + 0x00) = PER;
+    *(unsigned *)(sh_m1_fld + 0x14) = (PER > fld_delta + 1000) ? (PER - fld_delta) : 1000;
+
+    ((fn2)FN_DCLEAN)((unsigned)sh_m1_ex, SH_M1_EX_SZ);
+    ((fn2)FN_DCLEAN)((unsigned)sh_m1_tg, SH_M1_TG_SZ + SH_M1_FLD_SZ + 16);
+
+    sh_m1_patched = 1;
+    sh_poke(SH_M1_TAB_EX + 4 * SH_M1_SLOT_EX, (unsigned)sh_m1_ex);
+    sh_poke(SH_TGTAB + 4 * SH_M1_DRV, (unsigned)sh_m1_tg);
+    sh_poke(SH_TGTAB + 0xe4 + 4 * SH_M1_DRV, (unsigned)sh_m1_fld);
+    sh_poke(SH_M1_CACHE1 + 0, W);            sh_poke(SH_M1_CACHE1 + 4, HH);
+    sh_poke(SH_M1_CACHE1 + 8, W);            sh_poke(SH_M1_CACHE1 + 12, HH);
+    sh_poke(SH_M1_CACHE1 + 0x1c, PER);
+    return 1;
+}
+
+static void sh_m1_restore_tables(void)
+{
+    unsigned i;
+    if (sh_m1_fc3c_saved) {
+        sh_poke(0xfc3c, sh_m1_fc3c0);
+        sh_m1_fc3c_saved = 0;
+    }
+    if (sh_m1_patched) {
+        sh_poke(SH_M1_TAB_EX + 4 * SH_M1_SLOT_EX, SH_M1_REC_EX);
+        sh_poke(SH_TGTAB + 4 * SH_M1_DRV, SH_M1_ROMREC);
+        sh_poke(SH_TGTAB + 0xe4 + 4 * SH_M1_DRV, sh_m1_orig_fld);
+        for (i = 0; i < 9; i++) sh_poke(SH_M1_CACHE1 + 4 * i, sh_m1_orig_cache[i]);
+        sh_m1_patched = 0;
+    }
+}
+
+static int sh_m1_enter(void)   // v182 (C.4): arm tables + overrides + Lua m1_on
+{
+    unsigned h;
+    sh_m1_ok = 0;
+    if (!sh_m1_arm_tables()) { sh_say("1440p", "tables RAM refusees"); return 0; }
+    sh_expo_apply();
+    sh_install_trap();
+    sh_say("1440p", "armement...");
+    if (pv_ok()) { pv_m1_mask(1); sh_hud(1); }
+    sh_hook_w(SH_IPC_ARG_OFF, sh_m1_fc3c());                    // v185: [0xfc3c] for this head height (Lua m1_on)
+    if (!sh_ipc_req(SH_IPC_M1_ON, 12000)) {
+        sh_m1_restore_tables();
+        sh_expo_off();
+        sh_say("1440p", "bascule refusee");
+        return 0;
+    }
+    h = shamem(0xc0f06804);
+    slog("v182 m1 enter mode=%d tg=%d", *(volatile unsigned *)0x865c, *(volatile unsigned *)0xe664);
+    slog("  v182 m1 6804=%08x fc3c=%d", h, *(volatile unsigned *)0xfc3c);
+    if (!m1_ready() || (h >> 16) != (SH_M1_Y0 + sh_m1_head_h() - 1)) {
+        sh_m1_restore_tables();
+        sh_ipc_req(SH_IPC_M1_OFF, 8000);
+        sh_say("1440p", "tete inattendue");
+        return 0;
+    }
+    sh_m1_ok = 1;
+    sh_m1_armed_geom = sh_m1_geom(sh_prof());                   // v185
+    pv_has_img = 0;                                             // v185b: next sh_preview starts with a full opaque wipe
+    sh_say("1440p PRET", "REC = prise");
+    return 1;
+}
+
+static void sh_m1_leave(void)   // v182 (C.4): restore ROM tables + overrides, then Lua m1_off (-> mode 3 + MV_START)
+{
+    int need = sh_m1_ok || *(volatile unsigned *)0x865c == 1;
+    sh_m1_ok = 0;
+    sh_m1_restore_tables();
+    sh_expo_off();
+    if (need) sh_ipc_req(SH_IPC_M1_OFF, 8000);
+    pv_mask_clear();
+}
+
+// ---------------------------------------------------------------------------
+// v178: Film 1x3 (full APS-C width, 3x horizontal binning) armed by the shell itself,
+// = tools/_r147_session.py: in PLAY, TgPixelRes 41 (Film) -> RAM copy with a 640-clock line
+// (40 ms frame kept: 2000 lines), SIO hook TG table 800c=0 (no vertical skip), then the camera
+// enters record (Canon commits Film with our table), CMOS 7 = 0x140 (window, no ghost), head-error
+// trap; at the take MOVOFF 8 + WBSmth 0x133c88 = 50 (restored after). Lens on Film (dial).
+// ---------------------------------------------------------------------------
+#define SH_REC41    0xfc7301ec
+#define SH_X3LINE   640
+static char *sh_rec41 = 0;
+static int sh_x3_ok_now(void) { return sh_x3_ok; }
+static int sh_x3_head(void) { return (shamem(0xc0f06804) >> 16) == 0x4a6 && *(volatile unsigned *)0xe664 == 3; }
+static void sh_x3_restore_ptr(void)
+{
+    if (sh_rec41 && *(volatile unsigned *)(SH_TGTAB + 4 * 41) == (unsigned)sh_rec41) sh_poke(SH_TGTAB + 4 * 41, SH_REC41);
+}
+static int sh_x3_arm(void)   // returns 1 when Film 1x3 runs (head 1190 lines, TG running)
+{
+    unsigned i, fr, per;
+    volatile unsigned *hdr;
+    sh_x3_ok = 0;
+    if (!sh_hook || *(volatile unsigned *)((unsigned)sh_hook + 0x200) != 0x364f4953) { sh_say("1x3", "hook v6 absent"); return 0; }
+    if (*(volatile unsigned short *)SH_REC41 != 520 || *(volatile unsigned short *)(SH_REC41 + 0xc) != 2461 || *(volatile unsigned short *)(SH_REC41 + 0x80) != 2381) { sh_say("1x3", "table Film inattendue"); return 0; }
+    sh_say("1x3", "armement...");
+    sh_hud(1);
+    sh_x3_restore_ptr();                                      // ROM table while Canon changes modes
+    slog("v178b arm start rec=%d shoot=%d", camera_info.state.mode_rec, camera_info.state.mode_shooting);
+    // v178d: the Film mode is chosen by the user (capmode.set from the script did not stick: live 21:30, back in photo 727 lines)
+    if (!camera_info.state.mode_video) { sh_say("PASSE EN MODE FILM", "puis REC"); return 0; }
+    if (!camera_info.state.state_kbd_script_run) { sh_say("SCRIPT ARRETE", "eteindre / rallumer"); slog("v178d no script", 0, 0); return 0; }
+    // Film (auto) + PLAY by the Lua script; arming must happen in PLAY (r141: arming in a live Film kills the camera)
+    if (!sh_ipc_req(SH_IPC_PLAY, 20000)) { sh_say("1x3", "script: lecture impossible"); return 0; }
+    msleep(500);
+    slog("v178b in play rec=%d tg=%d", camera_info.state.mode_rec, *(volatile unsigned *)0xe664);
+    if (!sh_rec41) { unsigned b = (unsigned)malloc(0xd0 + 64); if (!b) return 0; sh_rec41 = (char *)((b + 31) & ~31u); }
+    memcpy(sh_rec41, (void *)SH_REC41, 0xd0);
+    fr = (40000u * 32 + SH_X3LINE / 2) / SH_X3LINE;          // 2000 lines
+    per = (fr * SH_X3LINE + 16) / 32;                         // 40000 us
+    for (i = 0; i < 10; i += 2) *(unsigned short *)(sh_rec41 + i) = *(volatile unsigned short *)(SH_REC41 + i) - 520 + SH_X3LINE - 1;
+    *(unsigned short *)(sh_rec41 + 0x0c) = fr; *(unsigned short *)(sh_rec41 + 0x10) = fr; *(unsigned short *)(sh_rec41 + 0x80) = fr - 80;
+    *(unsigned *)(sh_rec41 + 0xc8) = per;
+    ((fn2)FN_DCLEAN)((unsigned)sh_rec41, 0xd0);
+    sh_poke(SH_TGTAB + 4 * 41, (unsigned)sh_rec41);
+    slog("v178b table41 %x", (unsigned)sh_rec41, 0);
+    // TG override table: only 800c = 0 (sh_expo_apply owns entries 0/1 for Tv; 800c goes in entry 2)
+    hdr = (volatile unsigned *)((unsigned)sh_hook + 0x200);
+    sh_hook_w(0x200 + 28, 0); sh_hook_w(0x200 + 44, 0);
+    for (i = 0; i < 64; i++) { sh_hook_w(0x300 + 4 * i, 0); sh_hook_w(0x400 + 4 * i, 0); }
+    sh_hook_w(0x308, 0x800c0000u);
+    sh_hook_w(0x200 + 40, 0);
+    sh_hook_w(0x200 + 28, 1);
+    // enter record by the Lua script (half-press + set_record, as _r147_session.py)
+    if (!sh_ipc_req(SH_IPC_REC, 20000)) { sh_x3_restore_ptr(); sh_expo_apply(); sh_say("1x3", "script: visee impossible"); return 0; }
+    for (i = 0; i < 80 && !sh_x3_head(); i++) msleep(100);
+    slog("v178 x3 arm head=%08x tg_hits=%d", shamem(0xc0f06804), hdr[10]);
+    sh_hook_w(0x308, 0);                                      // 800c only matters at the commit
+    sh_x3_restore_ptr();                                      // the running Film keeps the slow line until the next commit
+    sh_expo_apply();                                          // ISO/Tv overrides back (v174)
+    if (!camera_info.state.mode_video || !hdr[10] || !sh_x3_head() || shamem(0xc0f06008) != 0x0280027e) { sh_say("1x3", "commit refuse"); slog("v178 x3 fail 6008=%08x", shamem(0xc0f06008), 0); return 0; }
+    sh_hook_w(0x240 + 4 * 7, 0x10000 | 0x140);                // CMOS 7 = 0x140 (r144/r145: window without ghost)
+    sh_hook_w(0x200 + 20, 1);
+    sh_install_trap();
+    sh_x3_ok = 1;
+    sh_say("1x3 PRET", "REC = prise");
+    return 1;
+}
+static unsigned sh_x3_mov0 = 0, sh_x3_wb0 = 0;
+static void sh_x3_take_begin(void)   // MOVOFF 8 + POKE 0x133c88 = 50 (as tools/m10x3raw.py)
+{
+    sh_x3_mov0 = *(volatile unsigned *)0x35d7c; sh_poke(0x35d7c, sh_x3_mov0 & ~8u);
+    sh_x3_wb0 = *(volatile unsigned *)0x133c88; sh_poke(0x133c88, 50);
+}
+static void sh_x3_take_end(void)
+{
+    sh_poke(0x35d7c, sh_x3_mov0);
+    sh_poke(0x133c88, sh_x3_wb0);
+}
 static void shell_task(void)
 {
     static int osd_saved = -1;
+    unsigned prev_kind;
     sh_on = 1;
-    slog("v174 shell start", 0, 0);
-    osd_saved = conf.show_osd; conf.show_osd = 0;                    // v174: no CHDK OSD (DNG/space/batt/clock/temp)
+    sh_m1_ok = 0;
+    { int fu = open("A/M10USB.OK", O_RDONLY, 0777); if (fu >= 0) { close(fu); sh_usb_ok = 1; } else sh_usb_ok = 0; }
+    sh_pwr_lock(1);                                           // v182 (A.5-6): block Canon APO while shell runs
+    slog("v185b shell start", 0, 0);
+    osd_saved = conf.show_osd; conf.show_osd = 0;             // v174: no CHDK OSD (DNG/space/batt/clock/temp)
     draw_restore();
     if (sh_usb()) { sh_say("USB branche", "shell arrete"); goto out; }   // v162
     if (!sh_install_hook()) { sh_say("ERREUR", "hook capteur refuse"); goto out; }
     if (!sh_arm_fps(sh_prof(), 1)) { sh_say("ERREUR", "cadence refusee"); goto out; }
-    slog("v160 hook %x rec46 %x", (unsigned)sh_hook, *(volatile unsigned *)(SH_TGTAB + 4 * 46));
+    wb_wd_start();                                            // v182 (A.5-1): independent WBInteg watchdog (prio 0x18)
+    slog("v182 hook %x rec46 %x", (unsigned)sh_hook, *(volatile unsigned *)(SH_TGTAB + 4 * 46));
     sh_expo_apply();
     sh_av_apply();
     remove("A/M10SH.END");
-    sh_say("M10 CINE", "touche la loupe x5");
+    prev_kind = sh_prof()->kind;
+    if (prev_kind == SH_M1) sh_say("M10 1440p", "initialisation...");
+    else sh_say("M10 CINE", prev_kind == SH_X3 ? "REC = armer 1x3" : "touche la loupe x5");
     for (;;) {
         unsigned h = shamem(0xc0f06804), kb;
         int zoom = (h == 0x045702a6), nv;
         const sh_prof_t *pr = sh_prof();
+        // v182 (C.4): handle profile transitions into / out of ImgMode 1 cleanly
+        if (prev_kind == SH_M1 && pr->kind != SH_M1) {
+            wb_wd_force = 1; wb_kick_now(); sh_m1_leave(); msleep(400); wb_wd_force = 0;   // v185b: WBInteg.c:3491 assert on 1440p -> x5/1x3
+            sh_arm_fps(pr, !zoom);
+            sh_expo_apply();
+            if (pr->kind == SH_X3) sh_say("1x3 25p 12b", "REC = armer");
+            else sh_say(pr->tag, "touche la loupe x5");
+            sh_hud(1);
+        }
+        prev_kind = pr->kind;
+
+        // ---------------- v182: ImgMode 1 1920x1440 1:1 ----------------
+        if (pr->kind == SH_M1) {
+            sh_install_trap();
+            sh_gui_assert();
+            if (sh_usb()) { sh_say("USB branche", "sortie"); break; }
+            if (sh_quit_req || (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET))) { sh_say("M10 CINE", "sortie"); break; }
+            if (sh_m1_ok && sh_m1_geom(pr) != sh_m1_armed_geom) {   // v185: ImgMode 1 geometry changed -> full re-enter
+                slog("v185 m1 geom %x -> %x", sh_m1_armed_geom, sh_m1_geom(pr));
+                wb_wd_force = 1; wb_kick_now();
+                sh_m1_enter();
+                wb_wd_force = 0;
+                sh_hud(1);
+                msleep(100);
+                continue;
+            }
+            if (!sh_m1_ok) {
+                if (m1_ready() && (h >> 16) == (SH_M1_Y0 + sh_m1_head_h() - 1)) {
+                    sh_m1_ok = 1;
+                } else if (!camera_info.state.mode_rec) {
+                    sh_say("1440p", "passage en visee...");
+                    sh_hud(1);
+                    wb_wd_force = 1; wb_kick_now();           // v184c: WB keepalive across the REC switch
+                    if (*(volatile unsigned *)0x865c == 1) { sh_m1_restore_tables(); sh_expo_off(); sh_ipc_req(SH_IPC_M1_OFF, 5000); }
+                    sh_ipc_req(SH_IPC_REC, 8000);
+                    wb_wd_force = 0;
+                    msleep(200);
+                    continue;
+                } else if (*(volatile unsigned *)0x865c == 3 && *(volatile unsigned *)0xe664 == 3 && !camera_info.state.mode_video) {
+                    sh_m1_enter();
+                    sh_hud(1);
+                    msleep(100);
+                    continue;
+                } else {
+                    nv = sh_handle_nav(0);
+                    sh_say("MODE PHOTO (M) REQUIS", "Tourner molette -> M");
+                    sh_hud(nv != 0);
+                    msleep(150);
+                    continue;
+                }
+            }
+            if (!m1_ready()) {
+                sh_m1_ok = 0;
+                sh_m1_restore_tables();
+                sh_say("MODE 1440p PERDU", "re-armement...");
+                sh_hud(1);
+                msleep(300);
+                continue;
+            }
+            nv = sh_handle_nav(0);
+            if (nv == 2 && (sh_prof()->kind != SH_M1 || sh_m1_geom(sh_prof()) != sh_m1_armed_geom)) continue;   // profile switched away from 1440p
+            if (nv == 2) pv_m1_mask(1);
+            kb = GetFreeCardSpaceKb();
+            sh_hud(nv != 0);
+            if (kb >= 600 * 1024) {                           // live RGGB 1440p preview (4:3, 1:1 focus, or OFF) until REC/MENU/USB/profile
+                sh_stop_req = 0; sh_pv = 1;
+                sh_pv_hud();
+                lv_x3();
+                sh_pv = 0;
+                if (sh_pv_key == 3) { sh_say("M10 CINE", "sortie"); break; }
+                if (sh_pv_key == 4) { sh_say("USB branche", "sortie"); break; }
+                if (sh_pv_key == 7) continue;                 // profile changed away from 1440p
+                if (sh_pv_key == 5) { sh_m1_ok = 0; sh_m1_restore_tables(); sh_say("MODE 1440p PERDU", 0); msleep(200); continue; }
+                if (sh_pv_key == 6) { sh_say("APERCU EN ERREUR", "REC reste possible"); sh_hud(1); msleep(800); }
+                if (sh_pv_key != 1 && sh_pv_key != 2) {
+                    if (sh_pv_key != 6) { msleep(100); continue; }
+                    if (!(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
+                }
+                sh_key = (sh_pv_key == 2 || kbd_is_key_pressed(KEY_SET)) ? KEY_SET : KEY_VIDEO;
+                sh_wait_release(); sh_stop_req = 0;
+            } else {
+                if (kbd_is_key_pressed(KEY_MENU) || !(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
+                sh_key = kbd_is_key_pressed(KEY_VIDEO) ? KEY_VIDEO : KEY_SET;
+                sh_wait_release();
+            }
+            if (!m1_ready()) { sh_m1_ok = 0; sh_m1_restore_tables(); continue; }
+            if (kb < 600 * 1024) { sh_say("CARTE PLEINE", 0); sh_hud(1); msleep(1500); continue; }
+            if (!sh_next_take()) { sh_say("PLUS DE NUMERO LIBRE", 0); sh_hud(1); msleep(1500); continue; }
+            if (*(volatile unsigned *)0xfc3c != sh_m1_fc3c()) {   // v184c: Canon ReEVF ran (MotionVector awake): full re-enter, no blind poke
+                slog("v184c fc3c reset=%d -> re-enter", *(volatile unsigned *)0xfc3c, 0);
+                sh_m1_enter();
+                if (!sh_m1_ok) continue;
+            }
+            *(volatile unsigned *)0xfa84 = 0;
+            sh_gui_assert();
+            sh_rec_on = 1; sh_rec_t0 = get_tick_count(); sh_l1[0] = 0; sh_hud_clear(); sh_hud(1);
+            camera_set_led(4, 1, 0);
+            sh_stop_req = 0;
+            lv_x3();                                          // REC 1920x1440 until stop / error / XR_MAX frames
+            camera_set_led(4, 0, 0); sh_rec_on = 0;
+            sh_wait_release(); msleep(300); sh_stop_req = 0;
+            sh_frames = xr_wr;
+            sprintf(sh_line, "%u images%s%s", sh_frames, msg[0] ? "  " : "", msg);
+            slog("v182 m1 take %d frames=%d", sh_take, sh_frames);
+            // v182 (C.4): NEVER re-switch ImgMode 1 after a take; only check health + [0xfc3c]
+            if (!m1_ready()) { sh_m1_ok = 0; sh_m1_restore_tables(); sh_say("MODE 1440p PERDU", "re-armement..."); }
+            else {
+                if (*(volatile unsigned *)0xfc3c != sh_m1_fc3c()) sh_poke(0xfc3c, sh_m1_fc3c());
+                *(volatile unsigned *)0xfa84 = 0;
+                sh_say(xr_base + 2, sh_line);
+            }
+            sh_hud_clear(); sh_hud(1);
+            msleep(1500);
+            continue;
+        }
+
+        // ---------------- Film 1x3 (v178) ----------------
+        if (pr->kind == SH_X3) {                              // v178: Film 1x3 profile (no magnifier, no preview)
+            sh_install_trap();
+            sh_gui_assert();
+            nv = sh_handle_nav(0);
+            if (nv == 2 && sh_prof()->kind != SH_X3) continue;
+            kb = GetFreeCardSpaceKb();
+            sh_hud(nv != 0);
+            if (sh_usb()) { sh_say("USB branche", "sortie"); break; }
+            if (sh_quit_req || (kbd_is_key_pressed(KEY_MENU) && kbd_is_key_pressed(KEY_SET))) { sh_say("M10 CINE", "sortie"); break; }
+            if (sh_x3_ok && !sh_x3_head()) { sh_x3_ok = 0; sh_hook_w(0x240 + 4 * 7, 0); sh_say("1x3 PERDU", "REC = rearmer"); }
+            if (kbd_is_key_pressed(KEY_MENU) || !(sh_key_down() || kbd_is_key_pressed(KEY_SET))) { msleep(50); continue; }
+            sh_key = kbd_is_key_pressed(KEY_VIDEO) ? KEY_VIDEO : KEY_SET;
+            sh_wait_release();
+            if (!sh_x3_ok) { sh_x3_arm(); sh_hud(1); sh_wait_release(); sh_stop_req = 0; continue; }   // 1st press arms, 2nd records
+            if (kb < 600 * 1024) { sh_say("CARTE PLEINE", 0); sh_hud(1); msleep(1500); continue; }
+            if (!sh_next_take()) { sh_say("PLUS DE NUMERO LIBRE", 0); sh_hud(1); msleep(1500); continue; }
+            sh_gui_assert();
+            sh_x3_take_begin();
+            sh_rec_on = 1; sh_rec_t0 = get_tick_count(); sh_l1[0] = 0; sh_hud_clear(); sh_hud(1);
+            camera_set_led(4, 1, 0);
+            sh_stop_req = 0;
+            lv_x3();
+            camera_set_led(4, 0, 0); sh_rec_on = 0;
+            sh_x3_take_end();
+            sh_wait_release(); msleep(300); sh_stop_req = 0;
+            sh_frames = xr_wr;
+            sprintf(sh_line, "%u images he %u%s%s", sh_frames, x_he_n, msg[0] ? "  " : "", msg);
+            slog("v178 x3 take %d frames=%d", sh_take, sh_frames);
+            { char nm[24]; int fe; sprintf(nm, "%s.HE", xr_base); fe = open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0777);   // head-error list next to the take (host repair: m10x3fix --log)
+              if (fe >= 0) { char ln[32]; unsigned q; for (q = 0; q < x_he_n && q < HE_ALL_N; q++) { int l = sprintf(ln, "he at frame %u\n", x_he_all[q] >> 8); write(fe, ln, l); } close(fe); } }
+            sh_say(xr_base + 2, sh_line); sh_hud_clear(); sh_hud(1);
+            msleep(1500);
+            continue;
+        }
+
+        // ---------------- x5 magnifier (v160-v176) ----------------
         sh_install_trap();                                    // lost at each magnifier entry / exit: re-arm always
         sh_gui_assert();                                      // v161
         if (!zoom && sh_armed_fps != pr->fps) sh_arm_fps(pr, 1);
         nv = sh_handle_nav(zoom);
+        if (nv == 2 && sh_prof()->kind != SH_X5) continue;
         if (nv == 2) pv_geom();
         kb = GetFreeCardSpaceKb();
         sh_hud(nv != 0);
@@ -4888,16 +6255,23 @@ static void shell_task(void)
         msleep(1500);
     }
 out:
+    wb_wd_force = 1; wb_kick_now();                           // v184c: keep WBInteg fed through the 1 -> 3 switch
+    sh_m1_leave();                                            // v182: restore ImgMode 1 -> Photo 3 while Lua & hook are still alive
+    msleep(400); wb_wd_force = 0;                             // v184c: settle (WBInteg.c:3491 3 s assert on MENU exit)
+    wb_wd_end();                                              // v182: stop WB watchdog before unloading hook/module
+    sh_ipc_req(SH_IPC_END, 1500);                             // v182: tell M10SHELL.LUA to exit cleanly before 0x9b50=0x121
     sh_uninstall();                                           // v162
-    slog("v174 shell end: %s", (unsigned)sh_l2, 0);
-    sh_hud_clear(); sh_hud(1); msleep(1500);
-    { unsigned y; for (y = 0; y < 240; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4); vid_bitmap_refresh(); }
+    sh_pwr_lock(0);                                           // v182: symmetric UnlockMainPower
+    slog("v182 shell end: %s", (unsigned)sh_l2, 0);
+    sh_hud_clear(); sh_hud(1); msleep(1000);
+    if (pv_ok()) { unsigned y; for (y = 0; y < 240; y++) memset(PV_RGBA + y * PV_BW, 0, PV_BW * 4); vid_bitmap_refresh(); }
     if (osd_saved >= 0) conf.show_osd = osd_saved;
+    { unsigned t = get_tick_count(); while (kbd_is_key_pressed(KEY_MENU) && get_tick_count() - t < 3000) msleep(20); }   // v184c: no PressMenuButton leak
     sh_quit = 1;
     sh_on = 0;                                                // sh_kbd() now returns 0: keys go back to Canon
     if (sh_prev_gui && camera_info.state.gui_mode == GUI_MODE_MODULE) gui_set_mode(sh_prev_gui);
     exit_alt();                                               // v176: leave CHDK ALT (kbd_blocked) -> Canon gets every key
-    { int fe = open("A/M10SH.END", O_WRONLY | O_CREAT | O_TRUNC, 0777); if (fe >= 0) { write(fe, "1\n", 2); close(fe); } }   // ends M10SHELL.LUA
+    { int fe = open("A/M10SH.END", O_WRONLY | O_CREAT | O_TRUNC, 0777); if (fe >= 0) { write(fe, "1\n", 2); close(fe); } }   // fallback marker for legacy Lua
     sh_quit_req = 0;
     task_running = 0;
     ExitTask();
@@ -4913,13 +6287,26 @@ static void sh_keywatch_task(void)
             else t_menu = 0;
         }
         if (((sh_key_down() && !kbd_is_key_pressed(KEY_MENU)) || (sh_rec_on && sh_usb())) && !sh_stop_req) { sh_stop_req = 1; }   // v162: USB ends the take
+        {   // v184a: half-press rising edge = 4:3 <-> 1:1 view toggle (ImgMode 1, standby and REC; Canon AF dip removed)
+            static unsigned hp_prev = 0;
+            unsigned hp = kbd_is_key_pressed(KEY_SHOOT_HALF) ? 1 : 0;
+            if (hp && !hp_prev && sh_is_m1() && (sh_pv || sh_rec_on) && !kbd_is_key_pressed(KEY_MENU) && !kbd_is_key_pressed(KEY_SET) && pv_mode != 2) {
+                pv_mode = (pv_mode == 1) ? 0 : 1;
+                pv_hud_dirty = 1;
+            }
+            hp_prev = hp;
+        }
         if (sh_rec_on) sh_gui_assert();                       // v161: keep REC away from Canon during a take
-        if (sh_rec_on) {                                      // v175: whole HUD redrawn at 1 Hz during a take (lowest-priority task)
+        if (sh_rec_on && sh_prof()->kind != SH_X3) {          // v175: whole HUD redrawn at 1 Hz during a take (v178e: not in 1x3; v182: also restores opaque mask in ImgMode 1)
             static unsigned last = 0xffffffff, wiped = 0;
             unsigned sec = (get_tick_count() - sh_rec_t0) / 1000;
-            if (sec != last) {
+            if (sec != last || pv_hud_dirty) {               // v184a: + immediate redraw after a view toggle
+                pv_hud_dirty = 0;
+                if (sh_m1_wide() && pv_ok()) pv_m1_mask(0);   // v185: Wide letterbox repaint on 0<->1
                 last = sec;
-                if (PV_RGBA[1 * PV_BW + 100] == 0 && wiped < 4) { wiped++; slog("v175 HUD wiped in RAM at %ds (n=%d)", sec, wiped); }   // erased vs not composited
+                if (pv_ok() && PV_RGBA[1 * PV_BW + 100] == 0 && wiped < 4) { wiped++; slog("v175 HUD wiped in RAM at %ds (n=%d)", sec, wiped); }   // erased vs not composited
+                if (sh_is_m1() && pv_ok() && ((sh_m1_wide() && pv_mode == 1) ? PV_RGBA[1 * PV_BW + 358] != PV_BLACK : PV_RGBA[21 * PV_BW + 358] != PV_BLACK))
+                    pv_m1_mask(pv_mode == 2);                 // v185b: mask corner (21, 358) / Wide focus: top HUD bar (1, 358)
                 sh_hud(1);                                    // redraw + vid_bitmap_refresh
             }
         }
@@ -4937,7 +6324,7 @@ int _run()
             close(fs);
             task_running = 1; sh_quit = 0;
             sh_say("M10 CINE", "installation");
-            CreateTask("M10Shell", 0x1A, 0x1000, shell_task);
+            CreateTask("M10Shell", 0x1A, 0x2000, shell_task);   // v182: 8 KiB stack
             CreateTask("M10Key", 0x1D, 0x1000, sh_keywatch_task);   // v175: 4 KiB (draws the full HUD during REC)
             running = 0;                                      // return at once (called from the autostart script); the
             return 0;                                         // module stays loaded while task_running. Keys are kept
@@ -4946,18 +6333,26 @@ int _run()
     }
     if (!task_running && ts_pinned) { strcpy(msg, "TSK pinned: do not reload"); running = 0; return -1; }
     if (!task_running) {
+        int fa = open("A/M10RUN.ASY", O_RDONLY, 0777);   // v181c: async run for the stand-alone Lua script:
+        if (fa >= 0) {                                    // blocking here would freeze the kbd task (no key
+            close(fa); remove("A/M10RUN.ASY"); remove("A/M10X3.END");   // state -> REC deaf to STOP, r159)
+            run_async = 1; task_running = 1;
+            CreateTask("M10Cine", 0x1A, 0x2000, cine_task);   // v182: 8 KiB stack
+            running = 0;
+            return 0;                                     // stays loaded while task_running (_module_can_unload)
+        }
         task_running = 1;
-        CreateTask("M10Cine", 0x1A, 0x1000, cine_task);
+        CreateTask("M10Cine", 0x1A, 0x2000, cine_task);       // v182: 8 KiB stack
     }
     while (task_running) msleep(50);
     draw_string(10, 40, msg, MAKE_COLOR(COLOR_BLACK, COLOR_WHITE));
-    msleep(4000);
+    { unsigned w; for (w = 0; w < (x_m1 ? 4 : 80); w++) { msleep(50); if (x_m1) wb_mon(0); } }
     running = 0;
     return 0;
 }
 
-int _module_can_unload() { return running == 0 && !task_running && !ts_pending && !ts_busy && !ts_pinned; }
-int _module_exit_alt() { if (!task_running && !ts_pending && !ts_busy && !ts_pinned) running = 0; return 0; }
+int _module_can_unload() { return running == 0 && !task_running && !wb_wd_on && pv_rec_done && pv_stby_done && !ts_pending && !ts_busy && !ts_pinned; }
+int _module_exit_alt() { if (!task_running && !wb_wd_on && pv_rec_done && pv_stby_done && !ts_pending && !ts_busy && !ts_pinned) running = 0; return 0; }
 
 libsimple_sym _librun = { { 0, 0, _module_can_unload, _module_exit_alt, _run } };
 

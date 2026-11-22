@@ -44,29 +44,47 @@ class V167ModuleTests(unittest.TestCase):
 
     def test_profiles_geometry_and_fps_math(self):
         block = extract_c_block(self.src, 'static const sh_prof_t sh_profs[] = {', '};')
-        # v172+: { fps, bpp, rsel, pad, fl, per, c0, w, tag }
-        entries = re.findall(r'\{\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*"([^"]+)"\s*\}', block)
-        self.assertEqual(len(entries), 8)
+        # v185+: { fps, bpp, rsel, kind, fl, per, c0, w, tag, h, lclk, m1_wide }
+        #   kind 0 = x5 magnifier (TG line 733), SH_X3 = Film 1x3 (SH_X3LINE 640), SH_M1 = ImgMode 1 (line lclk + 1)
+        entries = re.findall(r'\{\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+),\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),'
+                             r'\s*"([^"]+)",\s*(\d+),\s*(\d+),\s*(\d+)\s*\}', block)
+        n_rows = len(re.findall(r'^\s*\{', block, re.M))
+        self.assertEqual(len(entries), n_rows, 'a profile row does not match the v185 sh_prof_t layout')
+        self.assertEqual(len(entries), 14)
+        kinds = {'0': 0, 'SH_X5': 0, 'SH_X3': 1, 'SH_M1': 2}
+        self.assertEqual(sum(kinds[e[3]] == 0 for e in entries), 8, 'x5 magnifier profiles')
+        self.assertEqual(sum(kinds[e[3]] == 1 for e in entries), 1, 'Film 1x3 profiles')
+        self.assertEqual(sum(kinds[e[3]] == 2 for e in entries), 5, 'ImgMode 1 profiles')
+        self.assertEqual(kinds[entries[0][3]], 2, 'default profile must be ImgMode 1 1440p')
         self.assertTrue(any(int(e[1]) == 14 and int(e[2], 0) == 0x10 for e in entries), '14-bit HEAD profile missing')
-        for fps_s, bpp_s, rsel_s, _pad, fl_s, per_s, c0_s, w_s, tag in entries:
+        x3line = int(re.search(r'#define\s+SH_X3LINE\s+(\d+)', self.src).group(1))
+        for fps_s, bpp_s, rsel_s, kind_s, fl_s, per_s, c0_s, w_s, tag, h_s, lclk_s, wide_s in entries:
             fps, bpp, fl, per, c0, w = int(fps_s), int(bpp_s), int(fl_s), int(per_s), int(c0_s), int(w_s)
-            self.assertIn(bpp, (10, 14), tag)
+            h, lclk, wide, kind = int(h_s), int(lclk_s), int(wide_s), kinds[kind_s]
             self.assertEqual(w % 16, 0, tag)
-            self.assertEqual(c0 % 16, 0, tag)
-            self.assertGreaterEqual(c0, 72, tag)
-            self.assertLessEqual(c0 + w, 2592, tag)
-            eoff = c0 * bpp // 8
-            self.assertEqual(eoff * 8, c0 * bpp, tag)
-            self.assertEqual(eoff % 4, 0, tag)
-            self.assertLess(eoff, 2592 * bpp // 8, tag)
-            if bpp == 14:
-                self.assertLessEqual(w * 1104 * 14 // 8, 0x00400000, tag)   # 14-bit LJ92 input < 4 MiB
-            expected_per = round(fl * 733 / 32.0)
-            self.assertEqual(per, expected_per, tag)
-            real_fps = 1e6 / (fl * 733 / 32.0)
+            self.assertEqual(c0 % 16 if kind != 1 else c0 % 8, 0, tag)
+            if kind == 2:   # ImgMode 1: full sensor window, no c0 offset, explicit frame lines and TG line clock
+                self.assertIn(bpp, (10, 12), tag)
+                self.assertEqual(c0, 0, tag)
+                self.assertIn((w, h, wide), ((1920, 1440, 0), (1728, 1440, 1), (1728, 1800, 1)), tag)
+                line = lclk + 1
+            else:
+                self.assertEqual((h, lclk, wide), (0, 0, 0), tag)
+                self.assertIn(bpp, (10, 14) if kind == 0 else (12,), tag)
+                self.assertGreaterEqual(c0, 72, tag)
+                self.assertLessEqual(c0 + w, 2592, tag)
+                eoff = c0 * bpp // 8
+                self.assertEqual(eoff * 8, c0 * bpp, tag)
+                self.assertEqual(eoff % 4, 0, tag)
+                self.assertLess(eoff, 2592 * bpp // 8, tag)
+                if bpp == 14:
+                    self.assertLessEqual(w * 1104 * 14 // 8, 0x00400000, tag)   # 14-bit LJ92 input < 4 MiB
+                max_pv_c = ((c0 + 171 * w // 172) & ~1) + 1
+                self.assertLess(max_pv_c, 2592, tag)
+                line = 733 if kind == 0 else x3line
+            self.assertEqual(per, round(fl * line / 32.0), tag)
+            real_fps = 1e6 / (fl * line / 32.0)
             self.assertAlmostEqual(real_fps, fps, delta=0.02, msg=tag)
-            max_pv_c = ((c0 + 171 * w // 172) & ~1) + 1
-            self.assertLess(max_pv_c, 2592, tag)
 
     @unittest.skipUnless(shutil.which('cc'), 'host C compiler not available')
     def test_c_mlv_chunk_finalize_and_lj_drain(self):
@@ -89,6 +107,8 @@ static void msleep(long ms) { (void)ms; }
 static unsigned GiveSemaphore(int s) { (void)s; return 0; }
 
 static unsigned x_skipy = 0, x_zoom = 1, lvn_lb = 3240, lvn_bpp = 10, lj_eoff = 100, mlv_crop = 1;
+static unsigned x_m1 = 0, x_dr[3];                                       /* v180/v182: ImgMode 1 flag, drop reasons */
+static unsigned shamem(unsigned reg) { (void)reg; return 0; }           /* v180: ImgMode 1 OB probe (x_m1 = 0 here) */
 static unsigned xr_wr = 0, xr_prod = 0, xr_err = 0, x_ready = 0;
 static int xr_fd = -1, xr_sem = 1;
 static unsigned lj_cnt = 0, lj_err = 0, lj_cslot_n = 4, lj_kicked = 0, cb_done = 0;

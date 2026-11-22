@@ -1,137 +1,166 @@
-# EOS M10 RAW video
+# EOS M10 RAW Video
 
-Lossless RAW video on a Canon EOS M10 (firmware 1.10d), recorded to the SD card by a
-CHDK module. No host computer is needed once the card is set up.
+Turn a **Canon EOS M10** (firmware `1.10d`) into a **standalone cinema RAW camera** — recording lossless 10-bit, 12-bit, and 14-bit `.MLV` video directly to the SD card with live colour preview, focus peaking, zebras, and full manual exposure controls.
 
-What works today: **true 14-bit RAW**, 2048 × 1076 (2K DCI) or 1920 × 1076 at 24.000 fps,
-lossless-compressed MLV, read 1:1 from the sensor (no line skipping) in Canon's ×5 magnifier.
-Test takes of 150 frames run with 0 dropped frames, and the rare sensor head error is repaired
-in the camera. The older 10-bit profiles (up to 2512 wide, 24p/25p) are still in the shell.
-You start and stop takes with the camera's REC button, and set ISO, shutter and aperture from
-the shell.
-`tools/m10export.py` turns a take into CinemaDNG or ProRes 4444 LogC3 for Resolve. Third-party
-MLV players have not been tested much on these LJ92 files; one failed at the end of a
-multi-chunk take.
+**No computer is needed to shoot**, and **nothing is ever flashed to the camera** (everything runs in RAM via a CHDK module and disappears completely when you turn the camera off).
 
-This is a one-person research project on one camera. It is not a polished release, and there
-is no installer that hides the risk. Read [Safety](#safety) before you put it on a card.
+[![Canon EOS M10 - RAW video test](https://img.youtube.com/vi/bDyuFj6pS3c/hqdefault.jpg)](https://www.youtube.com/watch?v=bDyuFj6pS3c)
 
-[![Canon EOS M10 - RAW video test](https://youtube.com)](https://www.youtube.com/watch?v=bDyuFj6pS3c)
+> **Status (`v185b`)**: One-person open-source R&D project on one camera (`1.10d` only). Continuous multi-minute takes work reliably on fast SD cards, with **zero line-skipping** and **zero dropped frames** in tested modes. Read [Safety](#safety--faq) before putting it on a card.
 
-## How it works, briefly
+---
 
-The DIGIC 6 has a block (PACK32) that can send the sensor's RAW stream to an EDMAC channel.
-Canon only uses it for occasional stills-pipeline captures. The module (`module/m10_cine.c`)
-borrows it once per sensor frame, synced to a TG/DFE serial write (`8830`) that marks the end
-of each readout, and copies the frame to RAM through EDMAC channel 12. Canon's own hardware
-lossless-JPEG encoder (the one behind CR2 files) then compresses the frame, and a third task
-writes it to the card in Magic Lantern's MLV format.
+## What It Can Shoot
 
-Three RAM patches make this possible without touching any engine register by hand:
+Pick your format directly on the camera (`◄ / ►` on the **Profile** field). All modes record lossless-compressed RAW (Canon's own hardware lossless JPEG encoder, wrapped in Magic Lantern `.MLV` files).
 
-- the magnifier's TgPixelRes record is copied and lengthened so Canon itself programs a
-  25 fps frame (stock is 30 fps, and the encoder needs 35 ms per frame);
-- a hook on Canon's SIO send pointer (`*(0x9b50)`) logs every sensor/TG write, which gives
-  the frame sync;
-- a stub replaces the head-error callback, so a sensor read hiccup is counted instead of
-  shutting the camera down.
+| Profile | Captured Sensor Area | Effective Aspect / FOV | Bit Depth & FPS | Live Preview | Best For |
+|---|---|---|---|---|---|
+| **`1440p 24p 10b`** *(default)* | `1920 × 1440` (`1:1` crop) | `4:3` — crisp 1:1 pixels, no binning | 10-bit · `24.00p` | Colour + peaking + `1:1` zoom | Everyday sharp cinema look, long takes |
+| **`1440p 24p 12b`** | `1920 × 1440` (`1:1` crop) | `4:3` — crisp 1:1 pixels, no binning | 12-bit · `24.00p` | Colour + peaking + `1:1` zoom | Extra grading latitude in `4:3` |
+| **`Wide 1800 10b`** | `1728 × 1800` (`1:3` horiz. binning) | **100% APS-C width** · `2.88:1` native / `2.39:1` scope *(desqueezed `5184×1800`)* | 10-bit · `24.00p` | **Live `3×` desqueezed** + `2.39:1` guides + `1:1` zoom | **Full-width cinema widescreen** with no crop |
+| **`Wide 1440 12b`** | `1728 × 1440` (`1:3` horiz. binning) | **100% APS-C width** *(desqueezed `5184×1440`)* | **True 12-bit** · `24.00p` | **Live `3×` desqueezed** + `2.39:1` guides + `1:1` zoom | **Full-width 12-bit RAW** |
+| **`Wide 1440 10b`** | `1728 × 1440` (`1:3` horiz. binning) | **100% APS-C width** *(desqueezed `5184×1440`)* | 10-bit · `24.00p` | **Live `3×` desqueezed** + `2.39:1` guides + `1:1` zoom | Full-width with lower SD bitrate |
+| **`24p 2K 14b`** *(×5 loupe)* | `2048 × 1076` (`1:1` crop) | `1.90:1` 2K DCI (×5 magnifier) | **True 14-bit** · `24.00p` | B&W thumbnail + zebras | Maximum 14-bit dynamic range |
+| **`24p 1920 14b`** *(×5 loupe)* | `1920 × 1076` (`1:1` crop) | `16:9` (×5 magnifier) | **True 14-bit** · `24.00p` | B&W thumbnail + zebras | Safer 14-bit margin |
 
-All three are removed when the shell exits, and none survive a power cycle.
+*(Legacy `25p` / `10-bit` ×5 magnifier profiles and `Film 1×3` are also kept further down the profile list.)*
 
-## Status
+### What does "Wide `1:3` desqueezed" mean?
 
-| | |
+Think of it like shooting with a **3× anamorphic lens** — except done inside the sensor itself. To capture **100% of the APS-C width** at 24 fps with **zero vertical line-skipping** (no moiré, no stair-stepping), the sensor merges 3 horizontal pixels into 1 (`5184 → 1728` wide) while reading every single vertical line (`1440` or `1800` tall).
+
+- **On the camera screen**, the shell stretches the preview `3×` live so framing looks completely normal, with subtle `2.39:1` cinemascope guide marks.
+- **In post**, `tools/m10export.py` (or MLVApp) stretches the width back `3×` automatically — giving you true full-width APS-C widescreen with tall vertical resolution.
+
+---
+
+## Shooting On-Camera (Controls Cheat Sheet)
+
+Once launched, the shell takes over the screen with a clean cinema HUD:
+- **Top bar**: `REC` dot + timer, active profile, remaining recording minutes on the card, battery meter.
+- **Bottom bar**: `ISO` · `Shutter` · `Aperture` · `Profile` · `Zebras / Focus Peaking` · `View` (`4:3` / `WIDE` / `1:1` / `OFF`).
+
+| Control | Action |
 |---|---|
-| Camera / firmware | EOS M10, 1.10d only (addresses are hard-coded for 1.10d) |
-| Mode | ×5 magnifier, 2592 × 1104 read, centre crop recorded |
-| Default profile | `24p 2K 14b`: 2048 × 1104 (2048 × 1076 active), 14-bit unity (pre-processor tap `0x10` HEAD), LJ92, MLV class `0x21` |
-| Other profiles | `24p 1920 14b`, `25p 1920 14b`; 10-bit: `24p 2304/2512/2048/1920`, `25p 2304` |
-| Rate (14-bit 2K) | 24.000 fps, encoder ~39.4 ms per frame (max 39.9 of 41.7), ~2.2-2.3 MB per frame, ~53 MB/s to the card |
-| Validated | 4 × 150 frames at 2048 × 1104 14-bit (v173 encoder path): 0 drops, 0 encoder errors; head-error frames replaced by the previous frame with correct MLV numbering and timestamps |
-| Image | 14-bit unity gain, no missing codes, black 2048, read noise ~11.6 ADU (OB) |
-| Known limits | 14-bit is magnifier-only: Film 1×3 with the `0x10` tap still gives short frames. Very long 14-bit takes not yet qualified |
-| Module version | v176 |
+| **Mode dial → `M`** | Required for `1440p` and `Wide` modes (Photo Manual mode) |
+| **▲ / ▼** | Select a setting on the bottom bar |
+| **◄ / ►** | Change the selected value (including switching live between `1440p`, `Wide 1800`, and `Wide 1440`) |
+| **Half-press shutter** | **Instant `1:1` focus zoom with green Focus Peaking** — works in Standby **and** while recording! |
+| **REC** *(or **SET**)* | Start / stop recording (`M10_0001.MLV`, auto-splits into 2 GB chunks for continuous takes) |
+| **Hold MENU (1 s)** *(or **MENU + SET**)* | Exit the shell cleanly and return all buttons to Canon |
+| **Plug in USB cable** | Automatically stops and exits the shell so you can copy files to your computer |
 
-Full-sensor Film mode (1808 × 1184, 3×3 line skipping) also reaches 25 fps for a minute,
-but the moiré and highlight banding made it unusable, so that path is frozen. See
-[docs/HISTORY.md](docs/HISTORY.md).
+---
 
-## Quick start
+## 5-Minute Setup
 
-You need: an EOS M10 on firmware 1.10d, a CHDK 1.7 build for `m10-110d` on a FAT32 card,
-macOS or Linux with `arm-none-eabi-gcc`, Python 3 with `numpy` and `scipy`, and `ffmpeg`.
+### Requirements
 
-1. Build the module against a CHDK trunk checkout:
+- **Canon EOS M10** running firmware **`1.10d`** *(other firmware versions will not work — addresses are specific to `1.10d`)*.
+- **Fast FAT32 SD card** (UHS-I V30/V60/V90 capable of ~65–75 MB/s sustained write; cards ≥ 64 GB must be formatted FAT32/MBR for CHDK autoboot).
+- **[CHDK 1.7](https://chdk.fandom.com/wiki/CHDK)** build for `m10-110d` installed on the card.
+- **To compile the module** (macOS or Linux): `arm-none-eabi-gcc`, `git`, `make`.
+- **To export footage**: Python 3 (`numpy`, `scipy`), a C compiler (`cc`), and `ffmpeg`.
 
-   ```sh
-   git clone https://github.com/petabyt/chdk.git chdk   # mirror of CHDK SVN
-   (cd chdk && git checkout ad402e1b)
-   module/build.sh                                      # -> chdk/trunk/modules/.o4/m10cine.flt
-   ```
+### 1. Build `m10cine.flt`
 
-2. Copy to the card: `m10cine.flt` into `CHDK/MODULES/`, `card/CHDK/SCRIPTS/M10SHELL.LUA`
-   into `CHDK/SCRIPTS/`, and `card/M10HUF.BIN` and `card/M10HUF14.BIN` to the card root
-   (Huffman tables tuned on our footage, for 10-bit and 14-bit takes. Without the 14-bit table
-   a 14-bit take is ~25 % bigger and the 2K profile no longer fits the card bandwidth).
-3. In CHDK, enable Lua native calls, load `M10SHELL.LUA` as the script, and run it (or set it
-   to autostart). Leave the USB cable unplugged: the shell refuses to run with USB power.
-4. Put the camera in M (photo) mode and touch the screen to open the ×5 magnifier. The shell
-   shows a RAW preview (thumbnail or full frame) and a HUD: REC dot and timer, profile, card
-   minutes left, battery, and a bottom bar ISO / Tv / F / profile / zebras / view. UP/DOWN
-   picks a field, LEFT/RIGHT changes it. REC (or SET) starts a take, REC again stops it. After
-   changing between a 24p and a 25p profile, leave and re-enter ×5. Takes are
-   `A/M10_0001.MLV` (+ `.M00`, `.M01` chunks under 4 GB), 3000 frames at most.
-   Hold MENU for 1 s (or MENU + SET) to quit the shell; keys go back to Canon.
-5. On the computer:
+```sh
+git clone https://github.com/petabyt/chdk.git chdk   # mirror of CHDK SVN
+(cd chdk && git checkout ad402e1b)
+module/build.sh                                      # outputs chdk/trunk/modules/.o4/m10cine.flt
+```
 
-   ```sh
-   cc -O2 -o /tmp/ljc/lj92d tools/lj92d.c
-   python3 tools/m10ljmlv.py --check M10_0001.MLV          # decode every frame
-   FPS=24 python3 tools/m10export.py dng    M10_0001.MLV out_dng/  # CinemaDNG
-   FPS=24 python3 tools/m10export.py prores M10_0001.MLV out.mov   # ProRes 4444, LogC3 / AWG3
-   ```
+### 2. Copy 5 files to your SD card
 
-   Bit depth, black and white levels are read from the take (10-bit or 14-bit). `FPS` is only
-   the rate written in the output file: set 24 for the 24p profiles.
+```text
+SD Card (FAT32)
+├── M10HUF.BIN               ← card/M10HUF.BIN      (10-bit compression table)
+├── M10HUF12.BIN             ← card/M10HUF12.BIN    (12-bit compression table)
+├── M10HUF14.BIN             ← card/M10HUF14.BIN    (14-bit compression table)
+└── CHDK/
+    ├── MODULES/
+    │   └── m10cine.flt      ← built in step 1
+    └── SCRIPTS/
+        └── M10SHELL.LUA     ← card/CHDK/SCRIPTS/M10SHELL.LUA
+```
 
-   Host regression tests (no camera): `python3 -m unittest tools/test_m10_v167.py tools/test_m10hefix.py`.
+*(The three `M10HUF*.BIN` files are tuned lossless Huffman tables. Skipping them makes files ~25% larger and can cause dropped frames on high-bitrate profiles.)*
 
-## Safety
+### 3. Launch on the camera
 
-Things that went wrong during development and are now rules:
+1. Unplug the USB cable and turn the mode dial to **`M`**.
+2. Open the CHDK menu → **Miscellaneous Stuff → Enable Lua Native Calls** (`ON`).
+3. Open **Scripting Parameters → Load Script from File** → pick **`M10SHELL.LUA`**.
+4. Exit the CHDK menu (still in `<ALT>` mode) and press the **Shutter** button to start the shell.
+   *(Once you are comfortable with it, you can enable CHDK **Autostart** if you want it to boot straight into the cinema shell — leave it `OFF` while testing.)*
 
-- Never read an MMIO register (`0xC0xxxxxx`, `0xC0E0xxxx`, `0xD0xxxxxx`) directly over PTP or
-  from Lua. The camera freezes and needs the battery pulled. Read Canon's shadow copy instead
-  (`Cam.shadow()` in `tools/m10ptp.py`).
-- Do not change the shooting mode over PTP while a host session is open (`ASSERT OperTrns.c 649`).
-  Use the dial.
-- Do not upload files over USB while the magnifier is open (`ASSERT CtrlSrv.c 1035`).
-- If the camera shuts down, read `ROMLOG.LOG` (CHDK debug menu) before anything else.
-  `ShutdownReason 9 / ErrorNo 16` means ImgSens lost the sensor; it was always our DMA.
-- Everything here is RAM-only and goes away on power-off. Nothing writes to flash, and no
-  Canon code is in this repository. You still run unofficial code that drives DMA on your
-  camera; a bug can make it shut down mid-take and lose that take.
+---
 
-## Repository map
+## Editing & Grading Your Footage
 
-| Path | What |
+Takes are saved at the root of the SD card as `M10_0001.MLV` (plus `.M00`, `.M01`, … for long takes — the export tools automatically stitch chunks together).
+
+### Option A — One-command export (`tools/m10export.py`)
+
+Compile the tiny lossless JPEG decoder once:
+
+```sh
+mkdir -p /tmp/ljc && cc -O2 -o /tmp/ljc/lj92d tools/lj92d.c
+```
+
+Then export directly to **CinemaDNG** (true RAW for DaVinci Resolve's Camera RAW tab) or **ProRes 4444 in ARRI LogC3 / AWG3** (ready for Resolve, Premiere, or Final Cut):
+
+```sh
+# True RAW CinemaDNG sequence (DaVinci Resolve)
+FPS=24 python3 tools/m10export.py dng    M10_0001.MLV out_dng/
+
+# ProRes 4444 LogC3 (in Resolve: set input Color Space Transform to ARRI LogC3 / AWG3)
+FPS=24 python3 tools/m10export.py prores M10_0001.MLV out.mov
+```
+
+`m10export.py` automatically detects **10-bit, 12-bit, and 14-bit** takes, crops optical black only on modes that have it, and for **Wide `1:3`** takes:
+- automatically removes the sensor's autofocus pixel micro-lines (Hybrid CMOS AF II focus pixels),
+- writes the `3:1` anamorphic scale tag (`DefaultScale` in DNG / `setsar=3/1` in ProRes) so editors desqueeze it automatically. *(Pass `FPM=0` or `DESQ=1` to disable.)*
+
+### Option B — MLVApp
+
+You can open `.MLV` files directly in [MLVApp](https://mlv.app/):
+- For **`1440p`** and **`2K 14b`** takes: open and grade directly.
+- For **`Wide 1800`** / **`Wide 1440`** takes:
+  1. Set **Aspect Ratio / Stretch** to **`3:1`** (or `2.39:1` crop).
+  2. Copy [`card/fpm/M10_wide_1728x1800.fpm`](card/fpm/M10_wide_1728x1800.fpm) and [`card/fpm/M10_wide_1728x1440.fpm`](card/fpm/M10_wide_1728x1440.fpm) into MLVApp's focus-pixel map folder (or regenerate with `tools/m10wide_fpm.py`).
+     *Why?* The EOS M10 sensor has physical autofocus (PDAF) pixels embedded on 8 exact repeating red/blue positions (`3.33%` of pixels, `0%` of green). Canon's normal photo processor hides them automatically; in Wide `1:3` RAW they appear as faint horizontal micro-lines on bright flat surfaces until the `.fpm` map interpolates them out.
+
+---
+
+## Safety & FAQ
+
+- **Can this brick my camera?** No. Everything runs strictly in RAM. Nothing is written to flash, and no Canon firmware code is included in this repository. Power off the camera (or pull the battery) and it is 100% stock Canon again.
+- **Does it record sound?** Not yet — video only for now. Use an external audio recorder and sync in post.
+- **Why does the camera occasionally shut down if I experiment with host scripts?** You are still running unofficial code driving hardware DMA on the sensor. A bug during development can trigger a Canon assert and shut down mid-take (losing that take). If it ever shuts down, save `ROMLOG.LOG` from CHDK's Debug menu — it tells you the exact file and line that asserted.
+- **Developer USB/PTP safety rules**:
+  - Never read hardware MMIO registers (`0xC0xxxxxx`, `0xC0E0xxxx`, `0xD0xxxxxx`) directly over PTP or Lua — it freezes the camera. Always read Canon's RAM shadow copy (`Cam.shadow()` in `tools/m10ptp.py`).
+  - Never switch shooting modes over PTP during a host session (`ASSERT OperTrns.c 649`) — use the physical dial.
+  - Never upload files over USB while Canon's ×5 magnifier is open (`ASSERT CtrlSrv.c 1035`).
+
+---
+
+## Under the Hood & Developer Docs
+
+Want to understand how we bypassed Canon's 1108-line height wall, drove `ImgMode 1` continuously at 24.000 fps, achieved zero-stripe `1:3` horizontal binning, or built a 16 fps live colour preview on a Cortex-R4? Everything is documented in `docs/`:
+
+| Document | Contents |
 |---|---|
-| `module/` | The CHDK module source, the Makefile patch and `build.sh` |
-| `card/` | Files that go on the SD card besides the module |
-| `tools/` | Host tools: PTP client, hooks, capture drivers, MLV decode/repair/export. Index in [docs/TOOLS.md](docs/TOOLS.md) |
-| `tools/rom/`, `scripts/*.java` | ROM study helpers (need your own ROM dump and Ghidra project) |
-| `scripts/*.LUA` | Early CHDK Lua probes (PACK32, crossbar, zoom capture), kept for reference |
-| `docs/HANDOFF.md` | Start here to continue the work: open problems, ruled-out ideas, procedures |
-| `docs/ARCHITECTURE.md` | The capture pipeline and the firmware facts it rests on |
-| `docs/HISTORY.md` | How we got here, in order, including dead ends |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Full technical pipeline: `ImgMode 1` (`1440p` & `Wide 1:3`), PACK32/EDMAC CH12, JpCore lossless encoder, RAM IPC (`siohook6`), `M10WB` watchdog, live preview renderer, and Hybrid CMOS AF II focus pixel map |
+| **[docs/HISTORY.md](docs/HISTORY.md)** | Full R&D log from day 1 through `v185b`, including every dead end and breakthrough |
+| **[docs/HANDOFF.md](docs/HANDOFF.md)** | Current state (`v185b`), open next branches (audio `AUDF`, Wide tuning), host dev workflow, and card file reference |
+| **[docs/TOOLS.md](docs/TOOLS.md)** | Index of every Python / Lua / C tool and how to run the offline test suite (`python3 -B -m unittest discover -s tools -p 'test_*.py'`) |
 
-## Credits
+---
 
-CHDK (the port to the M10 and the module loader this runs in), Magic Lantern (the MLV format,
-the DIGIC 6 interrupt and register notes on its wiki, and `crop_rec`, which pointed at most
-of the sensor registers), and reyalp's DIGIC 6 SD overclocking thread on the CHDK forum.
+## Credits & License
 
-## License
+Built on top of **[CHDK](https://chdk.fandom.com/wiki/CHDK)** (EOS M10 `1.10d` port and `.flt` module loader), with deep inspiration from **[Magic Lantern](https://magiclantern.fm/)** (the `.MLV` container format, DIGIC 6 notes, and `crop_rec`), plus `reyalp`'s DIGIC 6 SD research on the CHDK forum.
 
-GPL v2, same as CHDK (see `LICENSE`). The module links against CHDK and is distributed under
-its terms.
+Licensed under **GPL v2** (same as CHDK — see [`LICENSE`](LICENSE)).

@@ -1,139 +1,95 @@
 # History
 
-Two weeks of work (31 October to 13 November 2026), compressed. Session tags (`probeNN`,
-`liveNN`) match the file names in the private capture archive and the version notes at the
-top of `module/m10_cine.c`. The dead ends are here on purpose: most of them took a day.
+The complete R&D story of EOS M10 RAW video (31 October to 22 November 2026), including the dead
+ends so nobody has to rediscover them. Session tags (`probeNN`, `liveNN`, `rNNN`) match the notes
+at the top of `module/m10_cine.c`.
 
-## 1. Getting CHDK running and finding the RAW (probe1-probe24)
+---
 
-- The camera is a 1.10d (MakerNote tag `0x001e` = `0x01100400`). The ROM studied in Ghidra
-  is 1.10f; most addresses match, not all.
-- A card of 64 GB or more formatted exFAT by the camera won't autoboot `DISKBOOT.BIN`.
-  Reformat FAT32 (MBR).
-- The first live-view captures looked like Bayer data and weren't. Every crossbar port that
-  carries the live view is UYVY 4:2:2. A port scan of `0x00-0x7f` found one linear source
-  (port `0x36`), and it turned out to be two colour planes (G | R) side by side, never blue.
-- The real RAW comes from PACK32 on crossbar port `0x00`, which is only active while PACK32
-  is switched on, following the order in Canon's `CaptureSystem.c`. In the ×5 magnifier this gave
-  full RGGB at 2592 px per line (probe24), and the first DNG rendered a colour chart correctly.
+## 1. Getting CHDK running and finding the RAW (`probe1–probe24`)
 
-## 2. From one frame to a stream (probe25-probe52)
+- The camera is an EOS M10 `1.10d` (MakerNote `0x001e = 0x01100400`). Cards ≥ 64 GB formatted exFAT
+  won't autoboot `DISKBOOT.BIN`; FAT32/MBR is required.
+- Live-view crossbar ports carry UYVY 4:2:2 (and port `0x36` only G|R). True RGGB RAW comes from
+  `PACK32` on crossbar port `0x00`, activated following Canon's `CaptureSystem.c` sequence.
+- In the ×5 magnifier (`2592 × 1108`, 1:1 readout), `probe24` produced the first accurate colour-chart DNG.
 
-- Early runs shut the camera down. Rules came out of it: a capture longer than one frame
-  leaves the DMA armed; each EDMAC block must be under 4 MiB; re-arming needs full
-  reprogramming; 4-byte transfers are needed for the mosaic; only CH12 under Canon's resource
-  lock is safe in the magnifier.
-- probe37: one 2-D transfer (two blocks of ~554 lines) copies a full 5.7 MB frame.
-- probe38-39: the first C module, `m10cine.flt`. Running in the CHDK menu task killed the
-  camera; a dedicated task survived 642 frames.
-- probe40: PACK32 outputs 10 and 12 bits natively, keeping the high bits.
-- probe43-46: Canon's CR2 lossless encoder (`LosslessEncode.c` / `JpCore.c`) works from the
-  module. With PACK32 pack mode 2 the output decodes bit-exact with `tools/lj92d.c`.
-- probe48-52: three tasks (capture, encode, write). 240/240 frames of 2592 × 924 14-bit
-  lossless at 24 fps (probe52). That was in the magnifier, with no frame sync yet.
+## 2. From one frame to a 3-task stream (`probe25–probe52`)
 
-## 3. Full field of view in Film mode (probe53-live107)
+- Learned hardware DMA rules: each EDMAC block `< 4 MiB`, 4-byte transfers for full RGGB, full
+  reprogramming per frame, explicit `ctl = 2` stop, restore PACK32 before releasing sem #6, run in a
+  dedicated DryOS task (not CHDK menu task).
+- `probe43–46`: Canon's hardware CR2 lossless JPEG encoder (`LosslessEncode.c` / `JpCore.c`) works
+  from our module with PACK32 pack mode 2 and decodes bit-exact with `tools/lj92d.c`.
+- `probe48–52`: 3-task pipeline (capture, encode, write) hit 240/240 frames in ×5 magnifier.
 
-The magnifier is a crop. The goal moved to the full sensor width in Film mode.
+## 3. Full field of view in Film mode (`probe53–live114b`)
 
-- Normal live view delivered data in bursts and shut the camera down at the end of passes
-  (`ShutdownReason 9 / ErrorNo 16`: ImgSens restarting the sensor and getting no TG answer).
-  The module was releasing PACK32 before restoring its registers. Fixed, but the shutdowns
-  kept coming.
-- live63: an SIO hook on `*(0x9b50)` logs every sensor and TG write. This is the tool most later
-  work relies on.
-- live65: TG `0x800c` = 0 during Canon's Film commit makes the sensor read every line: the
-  Magic Lantern "1×3" mode (full width, columns binned by 3, no line skipping).
-- live80: CMOS register 7 moves the vertical readout window. live100: leaving it at Canon's
-  `0x800` with all lines read superimposes a second sensor region (the "ghost" and the magenta
-  cast). `0x280` fixes it.
-- live84: syncing CH12 on the DFE `8830` write gave 20 clean consecutive frames.
-- live86-93: series still died at random, 1-3 % per frame. Holding PACK32 across frames, other
-  write channels, Canon's own capture service (`EvfCaptureSystem`) and memory-bandwidth tests
-  all failed the same way. Canon's own service fails too when chained, so it is a platform limit
-  under FHD readout, not our code.
-- live92: a regression hid for days. Diagnostic code copying 3 KiB of registers at each DMA
-  start was the cause. Lesson: re-run a control after changing instrumentation.
-- live94: Magic Lantern never runs its own RAW DMA on DIGIC 6/7/8. It asks Canon (`lv_save_raw`),
-  which the M10 ROM doesn't have.
-- live95: the fatal error is a head error (IRQ `HEAD_ERR`, status `0x40`).
-- live97: replacing the head-error callback with a counting stub. One error no longer kills
-  the camera: 214 frames, then 300/300 in manual focus (live98). Continuous AF caused most of
-  the errors.
-- live100-101: two more shutdown causes handled from the module. WBInteg waits for statistics
-  that never come after some errors (`ASSERT WBInteg.c 3491`): the module sets the event flag
-  itself. TgCtrl state is left at −1 by an ImgSens stop: the module resets it. 0 shutdowns over
-  55 takes.
-- live102: the grain was 3-4 stops of underexposure, not noise. AF pixels show as a 12-cells-per-
-  10 × 8 grid after the first head error; fixed in post (`fix_af`).
-- live103-107: trying to read more than 1190 lines. A coherent commit with a taller head passes
-  (worked out by emulating Canon's commit in unicorn, `tools/rom/emu_commit.py`), but the sensor
-  stream freezes after line 1190 whatever CMOS, TG or DFE registers say. The magnifier hits the
-  same wall at 1108. Still open.
+- `live63`: built the SIO send hook on `*(0x9b50)` (`siohook`) to log and override TG/DFE/CMOS writes.
+- `live65–107`: Film `1×3` (`TG 0x800c = 0`, `CMOS[7]` vertical window) and `3×3` (`1808×1190`).
+  Solved `HEAD_ERR` shutdowns (`[0xfa80]` counting stub), `WBInteg.c:3491` asserts, `WBCtrl` 640 ms
+  stalls (`0x133c88 = 50`), `LvMovOptimus` DRAM contention (`MOVOFF=8`), and RAM-buffered logs →
+  `1500/1500` frames at `24.97 fps`.
+- **Wall discovered (`live103–107`)**: neither Film (`1190`) nor ×5 (`1108`) allows taller frames;
+  above those heights the sensor stream freezes or head-errors continuously.
+- **Quality verdict (`live115`)**: Film `3×3` line-skipping had bad moiré and digital gain banding.
 
-## 4. Film 3×3 at 25 fps (live108-live114b)
+## 4. ×5 Magnifier at 25p/24p & true 14-bit (`live116–v176`)
 
-- live108: Canon's normal Film mode (`800c = 2`) already reads the whole 3:2 sensor one line in
-  three: 1728 × 1156 active, square pixels, no hacks needed.
-- live109: 25 fps capture holds without card writes (600/600). With card writes and the encoder,
-  head errors come back. The encoder takes ~30 ms for a full frame and there are only ~21 ms
-  between readouts. JpCore refuses any precision but 14; the reader accepts 10-bit input
-  directly, which removed a 200 ms CPU conversion. Custom Huffman tables: 1.95 MB per frame.
-- No Canon mode reads a sensor line faster than 16.25 µs. Changing the line time alone shuts
-  the camera down.
-- live110: clearing LvMovOptimus bit 3 (`MOVOFF=8`) stops Canon reprogramming its 1080p YUV
-  channel each frame, which removes ~11.5 MB of DRAM traffic per frame. Combined with starting
-  the encoder right at the end of our DMA and waiting up to 8 ms for the previous encode:
-  595/600 frames to the card.
-- live111: on a cool camera, 600/600 at 24.9 fps, 0 head errors, twice.
-- live112: keeping frames that had a head error (v148) instead of pausing 150 ms. The kept frame
-  loses ~230 rows and later frames shift by 12 px once; the reader repairs both.
-- live112b-113: the remaining drops came every 640 ms exactly. A 1 ms DryOS task sampler (v153)
-  pointed at `WBCtrl`: every 6th 100 ms cycle requests white-balance statistics, whose EDMAC
-  writes starve CH12. The cycle is set by a RAM threshold (`0x133c88`); raising it from 5 to 50
-  removed those drops.
-- live114b: the last 120 ms gaps were our own log. One `open/write/close` on the card from the
-  capture task cost two frames. Buffered in RAM: 1500/1500 frames at 24.97 fps.
+- `live116–119`: copied `TgPixelRes[46]` to RAM to slow the ×5 magnifier from 30 fps to 25p/24p without
+  poking live registers; built the first standalone shell (`v160–v167`) and `m10export.py` (CinemaDNG + ProRes 4444 LogC3).
+- `r125–r128` (`v170–v176`): discovered the `0x10` (`HEAD`) unity-gain 14-bit tap (no missing codes),
+  tuned `M10HUF14.BIN` (−25% size), added zero-copy in-camera head-error replacement (`v173`), and
+  rebuilt the HUD with live ISO / Tv / Aperture (`2K DCI 2048×1076 14-bit @ 24.000p`, 0 drops).
 
-## 5. Back to the magnifier, for image quality (live115-live122)
+## 5. Film `1×3` 12-bit (`r135–r147`, `v177–v178e`)
 
-- live115: the 3×3 minute looked bad. Line skipping makes moiré, and after the first head error
-  Canon applies a digital gain that clips at 948 and leaves gaps in the code values (banding).
-  Decision: modes with no line skipping only, so the ×5 magnifier at 1:1.
-- The magnifier runs at 30 fps and the encoder needs 33.6 ms for 2592 × 1080: too slow.
-- live116: slowed to 25 fps by copying Canon's TgPixelRes record to RAM with a longer frame and
-  letting Canon program it at magnifier entry. No register written by hand.
-- live117: 1500/1500 frames of 2592 × 1104 at 24.98 fps, 0 drops, 0 head errors, ~73 MB/s to the
-  card. In the magnifier, encoder plus capture fit in the frame, and Canon's background load is
-  much lighter than in Film. Height: +32 lines still hits the wall at 25 fps.
-- live118: stand-alone shell (v160-v161). The module installs its hooks itself and takes the
-  REC key away from Canon with its own GUI handler. No computer needed.
-- live119: drops on detailed scenes are the SD interface. Canon already runs it at the fastest
-  divider. Crop to 2400, then 2304 wide (v162-v163). The shell exits cleanly when USB is
-  plugged in (autostart plus USB used to shut the camera down).
-- live120-121: trying to make the LCD show the whole recorded frame. The magnifier window size
-  is an immediate constant in ROM code with no RAM hook on its path. Closed.
-- v164-v166: an on-screen thumbnail built from our own RAW instead.
-- live122: export tools for editing apps (`tools/m10export.py`: CinemaDNG, or ProRes 4444
-  LogC3 / ARRI Wide Gamut 3).
+- Stretched Film's `TgPixelRes[41]` line clock to `640` (`2000` lines @ 25p) so full-width `1×3`
+  12-bit RAW (`M10HUF12.BIN`, `CMOS[7] = 0x140`) fit the encoder (`120/120` frames). However, slow-line
+  Film `1×3` still suffered from `5.9 ADU` periodic column stripes requiring heavy host repair (`m10x3fix.py`).
 
-## 6. True 14-bit in the magnifier (v167-v176, 2026-11-14 to 11-17)
+## 6. Breaking the height wall: `ImgMode 1` `1440p` (`r150–r159`, `v180–v181c`)
 
-- v167: 24p profiles (24.000 fps by lengthening the TgPixelRes copy), RAW zebras, tail drain at
-  stop, split MLV headers.
-- r125-r126: the pre-processor tap selects what PACK32 sends. `0x12` (DEFOE, used so far) and
-  `0x22` (PREFIFO) carry a digital gain with missing codes; `0x10` (HEAD) gives unity 14-bit data.
-  Canon's encoder already crops a 14-bit source natively, so a 1920- or 2048-wide crop keeps its
-  input under 4 MiB (two CH12 blocks). First continuous 14-bit take: 1920 × 1104, 25p, 100/100.
-- v171: a 14-bit Huffman table (`M10HUF14.BIN`) instead of the 10-bit one: −25 % per frame
-  (the 10-bit table produced long codes and `0xff 0x00` stuffing). Black 2048 in RAWI.
-- r127-r128: `0x10` HEAD at 24.000p: 150/150 frames at 1920 and at 2048 wide, 0 drops,
-  ~2.2 MB per frame, encoder 39.4 ms of the 41.7 ms frame.
-- v172-v173: in-camera head-error repair. A frame hit by a head error is replaced by the previous
-  frame's payload with no copy (logical→physical slot map); only the writer patches the MLV frame
-  number and timestamp. Validated on 4 × 150 frames 2048 × 1104 14-bit, 0 drops.
-- v174-v176: shell UI rebuilt: HUD with timer, card minutes and battery, manual ISO / Tv /
-  aperture, 14-bit profiles first (`24p 2K 14b` default), HUD redrawn during REC, exit by holding
-  MENU 1 s (gives the keys back to Canon).
-- r135-r136: the `0x10` tap in Film 1×3 still gives short frames with a head error per pass.
-  14-bit stays a magnifier feature for now.
+- Audited Canon's Still/Capture path (`r150–r155`, `DrvType 9`, `Extract[3]`) and proved that
+  **`ImgMode 1`** runs continuously without the 1108/1190 height limit!
+- `r156–r159` solved every remaining piece for clean `1920×1440` `1:1` @ `24.000 fps`:
+  - `CMOS[5] = 0x300` + `CMOS[7] = 0xae9` centred the sensor window and removed the horizontal step.
+  - `CdsWritePair` (`0xfc414d25`) setting `c03a..c044 = 0x0247` restored clean OB `127.5` with zero stripes.
+  - Syncing CH12 on `CMOS[0]` (V-blank) instead of DFE `8830` locked frames with `< 100 µs` jitter.
+  - Patching `HivShdManLeo` `[0xfc3c] = 2073` eliminated the mysterious 1-in-3 head error.
+  - `MotionVector_Stop` freed EDMAC `0x23` for `JpCore`.
+
+## 7. Standalone `1440p` shell, live colour preview & focus peaking (`v182–v184c`, 22 Nov 2026)
+
+- **`v182`**: unified standalone shell (`m10cine.flt` + `M10SHELL.LUA`) with RAM-only IPC (`siohook6 +0x220/+0x224`,
+  zero SD polling during REC), `ContinuousAF` stop (`0xfc0fa287`, fixing the +10 s `ContinuousAF.c:1354` crash),
+  independent `M10WB` watchdog (`prio 0x18`), `LockMainPower`, opaque `360×240` RGBA overlay mask, and
+  validated 2 GiB file rolling (`1261` continuous frames, `drops=0`, `drops_at_roll=0`).
+- **`v183–v183d`**: added real-time green focus peaking, pre-roll 2 frames (eliminating the start-of-take gap),
+  true sensor-period `mlv_fps1000`, and tested Canon Hybrid AF dip + STM motor (`EFLensCom.MoveFocus` proved
+  relative-pulse in Photo M and silent no-op in `ImgMode 1`; PDAF continuous AF ruled `NO-GO` in `1:1` binning).
+- **`v184a–v184c`**: pivoted to **manual focus + fast live preview**:
+  - Compiled hot preview path with `PV_HOT` (`-O2 -fschedule-insns2` + **`-mword-relocations`**), pre-shifted
+    u32 Rec.709/WB LUTs, and 44-instruction inner loop.
+  - Async 8-slot Standby preview (`M10PvS`, `torn=0`) + continuous **~16 fps live REC preview** (`M10Pv`,
+    `ren_avg = 20–22 ms`, `0` drops over 2006 frames).
+  - Half-press shutter = instant **`4:3 ↔ 1:1` focus punch-in** in both Standby and REC.
+  - Hardened stability: `SetAutoShutdownTime(0)`, `ReEVF`/`[0xfc3c]` guard, and `WBInteg` keepalive on `MENU` exit.
+
+## 8. Full-width APS-C **Wide `1:3`** inside `ImgMode 1` (`r160`, `v185–v185b`, 22 Nov 2026)
+
+- **Hardware breakthrough (`r160`)**: discovered that the `3.7–4.5 ADU` vertical stripes in earlier `1:3`
+  attempts came solely from writing **`CMOS[3] = 0xf08`** alongside `CMOS[2] = 0x742`. Writing **only
+  `CMOS[2] = 0x742` + `CMOS[5] = 0x020`** inside `ImgMode 1` (keeping Still `CMOS[3] = 0x900`, `x0 = 0x30`,
+  `W = 1728`, `CDS = 0x0247`) produces **100% APS-C horizontal FOV with `0.03–0.06 ADU` column FPN** —
+  100× cleaner than Film `1×3`, with zero vertical stripes!
+- **`v185`**: integrated **`Wide 1800 10b`** (`1728×1800`, `lclk = 640`, `fl = 2080`, `2.88:1` native /
+  `2.39:1` = 83% APS-C), **`Wide 1440 12b`** (true continuous 12-bit 24p!), and **`Wide 1440 10b`** right
+  behind `1440p` (default), with dynamic `[0xfc3c]` IPC (`+0x280`) and a dedicated live `3×` desqueezed
+  preview (`pv_render_m1_wide`) with `2.39:1` guides and desqueezed `1:1` focus zoom.
+  - First real-world take (`M10_0044.MLV`): **542 frames `Wide 1800 10b` @ `24.000 fps`, `drops=0`, `he_n=0`, `LJ err=0`, `rec preview n=481 ren_avg=13 ms` (~21 fps live REC preview!)**.
+- **`v185b`**: fixed three field bugs from the first `v185` test:
+  1. Applied `x_lo = 37600` and `x_need = pr->h - 4` in **Standby** as well as REC (`Wide 1800` readout ends at `37,018 µs`).
+  2. Moved the overlay wipe sentinel from `(2, 30)` (which collided with the yellow `%` clip text at `(2, 22)`) to `(358, 21)` / `(358, 1)` and cleared `pv_has_img` on geometry switches.
+  3. Wrapped `sh_m1_leave()` on `ImgMode 1 → non-ImgMode 1` profile switches with `wb_wd_force` (`WBInteg.c:3491`).
+  4. Mapped the remaining subtle horizontal lines on bright flat areas to the exact **8-site `(y % 30, x % 8)` Hybrid CMOS AF II focus pixel lattice** (`3.33%` R/B, `0%` Green) and added `tools/m10wide_fpm.py` + MLVApp `.fpm` maps + automatic cleanup/desqueeze in `tools/m10export.py`.

@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Export an M10 shell take (compressed MLV, x5 magnifier) for a normal editing / grading app.
+"""Export an M10 shell take (compressed MLV) for a normal editing / grading app.
 
     m10export.py prores  M10_0007.MLV [OUT.mov]   ProRes 4444, ARRI LogC3 curve + ARRI Wide Gamut 3
     m10export.py dng     M10_0007.MLV [OUTDIR]    CinemaDNG sequence (true RAW, 16-bit, one file per frame)
 
 The .M00 / .M01 ... chunks next to the .MLV are picked up automatically.
+
+Takes (geometry from the decoded frame):
+    x5 magnifier / Film (h < 1440)   10-bit or 14-bit, optical-black rows 0-27 dropped (OB columns 0-71 too
+                                     when the frame is 2592 wide)
+    ImgMode 1 1440p (1920 x 1440)    10/12-bit, no OB rows or columns: the whole frame is active
+    ImgMode 1 Wide 1:3 (1728 x 1800, 1728 x 1440)
+                                     anamorphic, 3x horizontal squeeze, no OB; the Hybrid CMOS AF II focus
+                                     pixels (30 x 8 lattice, R / B sites only) are interpolated with
+                                     m10wide_fpm.fix_wide_raw() before anything else
 
 Options (environment variables):
     FIRST=0 LAST=        frame range (LAST excluded)
@@ -13,6 +22,17 @@ Options (environment variables):
     HEAD=4               ProRes: stops of headroom above 18 % grey for the sensor clip point
     WB=daylight|auto     ProRes: daylight (0.48 / 1 / 0.66) or grey-world from the first 25 frames
                          (DNG: the same neutral is written as AsShotNeutral, the app can change it)
+    FPM=1|0              Wide 1:3 only: focus pixel fix (default 1; 0 = raw sites kept, e.g. to use the
+                         card/fpm/M10_wide_1728x*.fpm map in MLV App instead). Ignored on other geometries.
+    DESQ=3|1             Wide 1:3 only: horizontal desqueeze factor (default 3; 1 = no desqueeze, square pixels)
+    DESQ_MODE=sar|scale  Wide 1:3 ProRes, DESQ=3:
+                         sar   (default) stream keeps the recorded 1728 x H pixels and is flagged anamorphic
+                               (setsar=3/1 -> MOV pasp 3:1). Lossless, fast, standard anamorphic ProRes:
+                               Resolve / Premiere / FCP / QuickTime display it at 5184 x H.
+                         scale lanczos resample to 5184 x H square pixels (for apps that ignore pasp; 3x the
+                               pixels and file size, no extra detail).
+                         DNG: DESQ=3 writes DefaultScale (tag 50718) = 3/1, 1/1, the DNG anamorphic flag
+                         Resolve / ACR / MLV App use to desqueeze; DESQ=1 leaves it out.
 
 ProRes log: in DaVinci Resolve, set the clip's input to "ARRI LogC3 / ARRI Wide Gamut 3"
 (Color Space Transform, or the built-in "ARRI LogC3 to Rec709" LUT); in Premiere / Final Cut,
@@ -20,7 +40,9 @@ use the "ARRI LogC3 to Rec709" LUT. Middle grey sits at the LogC3 EI 800 grey le
 CinemaDNG: import the folder in Resolve (Camera RAW tab: white balance, exposure, then any log).
 
 Per frame (both modes): LJ92 decode, head-error repair (m10ljmlv.repaired), black / white read from the
-MLV RAWI block (10-bit takes: 127.5 / 1023; 14-bit takes, v171+: 2048 / 16383).
+MLV RAWI block (10-bit takes: 127.5 / 1023; 14-bit takes, v171+ and every LJ92 ImgMode 1 take: 2048 / 16383).
+The pixels stay at that native scale end to end (no left-align, no shift): the focus pixel fix is a
+same-channel neighbour mean, so it is scale independent.
 ProRes adds: bilinear demosaic, white balance, camera -> AWG3 matrix (DNG ColorMatrix of the
 EOS M10), saturated pixels -> neutral, LogC3 encode, 10-bit 4:4:4.
 """
@@ -32,6 +54,7 @@ import m10ljmp4 as P
 import m10mlv as M
 import m10raw2dng as R
 import m10ljmlv as L
+import m10wide_fpm as F
 
 BLACK, WHITE = 127.5, 1023.0   # 10-bit defaults; main() replaces them with the take's RAWI values
 CLIP = WHITE - BLACK        # live122: x5 shell takes clip at 1023 (the 940 of the 3x3 Film mode cut 0.15 stop)
@@ -60,14 +83,40 @@ def chunks(mlv):
     return [mlv] + extra
 
 
+M1_MIN_H = 1440            # ImgMode 1 takes (1920 x 1440, 1728 x 1440, 1728 x 1800): no x5 / Film take is this tall
+WIDE_W = 1728               # ImgMode 1 Wide 1:3 window width (X0 0x30)
+WIDE_DESQ = 3               # Wide 1:3 horizontal squeeze
+
+
+def is_m1(img):
+    return img.shape[0] >= M1_MIN_H
+
+
+def is_wide(img):
+    """ImgMode 1 Wide 1:3 (1728 x 1800 / 1728 x 1440): 3x anamorphic, AF focus pixel lattice."""
+    return img.shape[1] == WIDE_W and img.shape[0] >= M1_MIN_H
+
+
 def active(img):
-    """Active area of a shell take: OB rows 0-27 dropped; OB columns only if the frame has them."""
-    x0 = 72 if img.shape[1] == 2592 else 0
-    a = img[28:, x0:]
+    """Active area of a shell take, even-cropped (RGGB phase kept).
+    ImgMode 1 (h >= 1440): no OB rows / columns, the whole frame is active.
+    x5 / Film (h < 1440): OB rows 0-27 dropped; OB columns 0-71 only if the frame has them (2592 wide)."""
+    if is_m1(img):
+        a = img
+    else:
+        x0 = 72 if img.shape[1] == 2592 else 0
+        a = img[28:, x0:]
     return a[:a.shape[0] // 2 * 2, :a.shape[1] // 2 * 2]
 
 
-def write_cdng(path, img, neutral, fps, frame):
+def prepare(img, fpm):
+    """Focus pixel fix (Wide 1:3, on the full frame: the lattice origin is its top-left), then active()."""
+    if fpm and is_wide(img):
+        img = F.fix_wide_raw(img)
+    return active(img)
+
+
+def write_cdng(path, img, neutral, fps, frame, desq=1):
     h, w = img.shape
     entries = []
 
@@ -90,6 +139,8 @@ def write_cdng(path, img, neutral, fps, frame):
     add(50721, 10, [(v, 10000) for v in M.COLOR_MATRIX_M10])
     add(50728, 5, [R.rational(v) for v in neutral])
     add(50778, 3, [21])                                                   # D65
+    if desq != 1:
+        add(50718, 5, [(int(desq), 1), (1, 1)])                           # DefaultScale: anamorphic desqueeze (H, V)
     add(50829, 4, [0, 0, h, w])                                           # ActiveArea
     add(51044, 10, [(int(round(float(fps) * 1000)), 1000)])               # FrameRate (CinemaDNG)
     s = frame // int(round(float(fps))); f = frame % int(round(float(fps)))
@@ -140,9 +191,27 @@ def main(a):
     last = int(os.environ['LAST']) if os.environ.get('LAST') else None
     ev = float(os.environ.get('EV', '0')); head = float(os.environ.get('HEAD', '4'))
     wbmode = os.environ.get('WB', 'daylight')
+    fpm = os.environ.get('FPM', '1') != '0'
+    desq = int(os.environ.get('DESQ', str(WIDE_DESQ)))
+    desq_mode = os.environ.get('DESQ_MODE', 'sar')
+    if desq < 1 or desq_mode not in ('sar', 'scale'):
+        print('DESQ must be >= 1, DESQ_MODE sar or scale'); return 2
     print('%s: %s -> %s  (%d-bit, black %.1f, white %d)' % (mode, ' + '.join(os.path.basename(f) for f in files), out, bpp, BLACK, WHITE), flush=True)
 
-    src = (active(img) for k, img in P.chained(files, first, last))
+    geom = {}                                    # set from the first decoded frame (full sensor window)
+
+    def frames():
+        for k, img in P.chained(files, first, last):
+            if not geom:
+                wide = is_wide(img)
+                geom.update(raw=img.shape, wide=wide, m1=is_m1(img), desq=desq if wide else 1)
+                kind = 'ImgMode 1 Wide 1:3' if wide else 'ImgMode 1' if geom['m1'] else 'x5 / Film'
+                print('%s %dx%d: %s%s' % (kind, img.shape[1], img.shape[0], 'no OB' if geom['m1'] else 'OB rows 0-27 dropped',
+                      ', focus pixel fix %s, desqueeze x%d%s' % ('on' if fpm else 'off', geom['desq'],
+                      ' (%s)' % desq_mode if mode == 'prores' and geom['desq'] > 1 else '') if wide else ''), flush=True)
+            yield prepare(img, fpm)
+
+    src = frames()
     neutral = DAYLIGHT
     pending = []
     if wbmode == 'auto':
@@ -160,10 +229,13 @@ def main(a):
     if mode == 'dng':
         os.makedirs(out, exist_ok=True)
         for img in stream():
-            write_cdng(os.path.join(out, '%s_%06d.dng' % (base, n)), img, neutral, fps, n)
+            write_cdng(os.path.join(out, '%s_%06d.dng' % (base, n)), img, neutral, fps, n, geom['desq'])
             n += 1
             if n % 100 == 0: print('%d frames' % n, flush=True)
-        print('-> %s  %d DNG, %dx%d, %s fps' % (out, n, img.shape[1], img.shape[0], fps))
+        if not n:
+            print('no frame'); return 1
+        print('-> %s  %d DNG, %dx%d, %s fps%s' % (out, n, img.shape[1], img.shape[0], fps,
+              ', DefaultScale %d:1' % geom['desq'] if geom['desq'] > 1 else ''))
         return 0
 
     wb = (1.0 / neutral).astype(np.float32)
@@ -182,9 +254,15 @@ def main(a):
         o = (np.clip(logc3(rgb), 0, 1) * 65535 + 0.5).astype('<u2')
         if p is None:
             h, w = o.shape[:2]
+            vf, ow = [], w
+            if geom['desq'] > 1 and desq_mode == 'sar':
+                vf = ['-vf', 'setsar=%d/1' % geom['desq']]           # anamorphic flag (MOV pasp), pixels untouched
+            elif geom['desq'] > 1:
+                vf = ['-vf', 'scale=iw*%d:ih:flags=lanczos,setsar=1' % geom['desq']]
+                ow = w * geom['desq']
             p = subprocess.Popen(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb48le',
-                                  '-s', '%dx%d' % (w, h), '-r', fps, '-i', '-',
-                                  '-c:v', 'prores_ks', '-profile:v', '4', '-pix_fmt', 'yuv444p10le', '-vendor', 'apl0',
+                                  '-s', '%dx%d' % (w, h), '-r', fps, '-i', '-'] + vf +
+                                 ['-c:v', 'prores_ks', '-profile:v', '4', '-pix_fmt', 'yuv444p10le', '-vendor', 'apl0',
                                   '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
                                   '-metadata:s:v', 'comment=ARRI LogC3 EI800 / ARRI Wide Gamut 3',
                                   out], stdin=subprocess.PIPE)
@@ -193,7 +271,9 @@ def main(a):
     if p is None:
         print('no frame'); return 1
     p.stdin.close(); rc = p.wait()
-    print('-> %s  %d frames, %dx%d, %s fps, ffmpeg rc %d' % (out, n, w, h, fps, rc))
+    print('-> %s  %d frames, %dx%d%s, %s fps, ffmpeg rc %d' % (out, n, ow, h,
+          ' (SAR %d:1, displays %dx%d)' % (geom['desq'], w * geom['desq'], h) if geom['desq'] > 1 and desq_mode == 'sar' else '',
+          fps, rc))
     return rc
 
 
