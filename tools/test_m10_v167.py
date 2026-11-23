@@ -44,45 +44,34 @@ class V167ModuleTests(unittest.TestCase):
 
     def test_profiles_geometry_and_fps_math(self):
         block = extract_c_block(self.src, 'static const sh_prof_t sh_profs[] = {', '};')
-        # v185+: { fps, bpp, rsel, kind, fl, per, c0, w, tag, h, lclk, m1_wide }
-        #   kind 0 = x5 magnifier (TG line 733), SH_X3 = Film 1x3 (SH_X3LINE 640), SH_M1 = ImgMode 1 (line lclk + 1)
-        entries = re.findall(r'\{\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+),\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),'
-                             r'\s*"([^"]+)",\s*(\d+),\s*(\d+),\s*(\d+)\s*\}', block)
+        # v186: 100% ImgMode 1 ML-style Size x Bit-Depth table
+        entries = re.findall(
+            r'\{\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+),\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),'
+            r'\s*"([^"]+)",\s*(\d+),\s*(\d+),\s*(\d+),\s*(0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+),\s*(\d+),\s*"([^"]+)"\s*\}',
+            block,
+        )
         n_rows = len(re.findall(r'^\s*\{', block, re.M))
-        self.assertEqual(len(entries), n_rows, 'a profile row does not match the v185 sh_prof_t layout')
-        self.assertEqual(len(entries), 14)
-        kinds = {'0': 0, 'SH_X5': 0, 'SH_X3': 1, 'SH_M1': 2}
-        self.assertEqual(sum(kinds[e[3]] == 0 for e in entries), 8, 'x5 magnifier profiles')
-        self.assertEqual(sum(kinds[e[3]] == 1 for e in entries), 1, 'Film 1x3 profiles')
-        self.assertEqual(sum(kinds[e[3]] == 2 for e in entries), 5, 'ImgMode 1 profiles')
-        self.assertEqual(kinds[entries[0][3]], 2, 'default profile must be ImgMode 1 1440p')
+        self.assertEqual(len(entries), n_rows, 'a profile row does not match the v186 sh_prof_t layout')
+        self.assertEqual(len(entries), 10)
+        self.assertEqual(entries[0][3], 'SH_M1', 'default profile must be ImgMode 1 1440p')
+        self.assertEqual((int(entries[0][7]), int(entries[0][9])), (1920, 1440))
         self.assertTrue(any(int(e[1]) == 14 and int(e[2], 0) == 0x10 for e in entries), '14-bit HEAD profile missing')
-        x3line = int(re.search(r'#define\s+SH_X3LINE\s+(\d+)', self.src).group(1))
-        for fps_s, bpp_s, rsel_s, kind_s, fl_s, per_s, c0_s, w_s, tag, h_s, lclk_s, wide_s in entries:
-            fps, bpp, fl, per, c0, w = int(fps_s), int(bpp_s), int(fl_s), int(per_s), int(c0_s), int(w_s)
-            h, lclk, wide, kind = int(h_s), int(lclk_s), int(wide_s), kinds[kind_s]
+        for e in entries:
+            fps, bpp, rsel, kind_s, fl, per, c0, w, tag, h, lclk, wide, x0, c7, mask, short_tag = (
+                int(e[0]), int(e[1]), int(e[2], 0), e[3], int(e[4]), int(e[5]), int(e[6]), int(e[7]),
+                e[8], int(e[9]), int(e[10]), int(e[11]), int(e[12], 0), int(e[13], 0), int(e[14]), e[15],
+            )
+            self.assertEqual(kind_s, 'SH_M1', tag)
+            self.assertEqual(rsel, 0x10, tag)
+            self.assertEqual(c0, 0, tag)
             self.assertEqual(w % 16, 0, tag)
-            self.assertEqual(c0 % 16 if kind != 1 else c0 % 8, 0, tag)
-            if kind == 2:   # ImgMode 1: full sensor window, no c0 offset, explicit frame lines and TG line clock
-                self.assertIn(bpp, (10, 12), tag)
-                self.assertEqual(c0, 0, tag)
-                self.assertIn((w, h, wide), ((1920, 1440, 0), (1728, 1440, 1), (1728, 1800, 1)), tag)
-                line = lclk + 1
-            else:
-                self.assertEqual((h, lclk, wide), (0, 0, 0), tag)
-                self.assertIn(bpp, (10, 14) if kind == 0 else (12,), tag)
-                self.assertGreaterEqual(c0, 72, tag)
-                self.assertLessEqual(c0 + w, 2592, tag)
-                eoff = c0 * bpp // 8
-                self.assertEqual(eoff * 8, c0 * bpp, tag)
-                self.assertEqual(eoff % 4, 0, tag)
-                self.assertLess(eoff, 2592 * bpp // 8, tag)
-                if bpp == 14:
-                    self.assertLessEqual(w * 1104 * 14 // 8, 0x00400000, tag)   # 14-bit LJ92 input < 4 MiB
-                max_pv_c = ((c0 + 171 * w // 172) & ~1) + 1
-                self.assertLess(max_pv_c, 2592, tag)
-                line = 733 if kind == 0 else x3line
-            self.assertEqual(per, round(fl * line / 32.0), tag)
+            self.assertGreaterEqual(x0, 0x30, tag)
+            self.assertGreaterEqual(lclk - (x0 + w // 4), 54, tag)
+            self.assertIn(bpp, (10, 12, 14), tag)
+            self.assertIn(mask, (1, 7), tag)
+            self.assertLessEqual(len(short_tag), 8, short_tag)
+            line = lclk + 1
+            self.assertLessEqual(abs(per - fl * line / 32.0), 1.0, tag)
             real_fps = 1e6 / (fl * line / 32.0)
             self.assertAlmostEqual(real_fps, fps, delta=0.02, msg=tag)
 

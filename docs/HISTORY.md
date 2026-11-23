@@ -1,6 +1,6 @@
 # History
 
-The complete R&D story of EOS M10 RAW video (31 October to 22 November 2026), including the dead
+The complete R&D story of EOS M10 RAW video (31 October to 23 November 2026), including the dead
 ends so nobody has to rediscover them. Session tags (`probeNN`, `liveNN`, `rNNN`) match the notes
 at the top of `module/m10_cine.c`.
 
@@ -93,3 +93,17 @@ at the top of `module/m10_cine.c`.
   2. Moved the overlay wipe sentinel from `(2, 30)` (which collided with the yellow `%` clip text at `(2, 22)`) to `(358, 21)` / `(358, 1)` and cleared `pv_has_img` on geometry switches.
   3. Wrapped `sh_m1_leave()` on `ImgMode 1 → non-ImgMode 1` profile switches with `wb_wd_force` (`WBInteg.c:3491`).
   4. Mapped the remaining subtle horizontal lines on bright flat areas to the exact **8-site `(y % 30, x % 8)` Hybrid CMOS AF II focus pixel lattice** (`3.33%` R/B, `0%` Green) and added `tools/m10wide_fpm.py` + MLVApp `.fpm` maps + automatic cleanup/desqueeze in `tools/m10export.py`.
+
+## 9. The `LCLK_HOLD0` `3.3×` Turbo Unlock & True 14-Bit `ImgMode 1` (`r161`, `v186`, 23 Nov 2026)
+
+- **Offline ROM audit (`r161`)**:
+  - Confirmed M10 has a single `JpCore` (`0xc0e00000`, IRQ `0x133`) and zero `1:2` horizontal binning modes (`CMOS[2] ∈ {0x0c6, 0x742}` across all 54 `DrvType`s).
+  - Found Canon's `Extract[3]` margin rule (`x1 ≤ lclk − 54`) and proved that the earlier `x0 = 0x34` `1440p` recipe sat **320 px left of optical centre**; optically centred `x0 = 0x30 + (2592 − W) / 8` (`0x84` for `1920`, `0x74` for `2048`, `0x66` for `2160`, `0x54` for `2304`, `0x30` for `2592` — verified to 1 pixel on live hardware, `corr = 0.9954`).
+  - Discovered two Canon-API refcounted clock holds never taken by `LosslessEncode`: **`LCLK_HOLD0` (`0xfc1803f3` / `0xfc180429`, `LclkChg.c`)** and **`ClockSave` gear-A (`0xfc1ec6d7` / `0xfc1ec6ed`, `MLHClock_DUKE.c`)**.
+- **True 14-bit native inside `ImgMode 1` (`r161` Batch B+C)**:
+  - Verified `RSEL = 0x10` unity 14-bit (`black = 2048`, `195/195` codes, all 4 LSBs at `0.50`, zero stripes) works directly inside `ImgMode 1` for both `1:1` crops and full-width `Wide 1:3` — retiring Canon's awkward ×5 magnifier path completely.
+- **The `LCLK_HOLD0` bombshell (`r161b` + `r161c`)**:
+  - Calling Canon's zero-argument refcounted `LCLK_HOLD0 (0xfc1803f3)` during `ImgMode 1` compressed REC dropped `LclkChg` from level `1` → `0` and **accelerated JpCore from `100.0 MB/s` (`39.3 ms`) to `237.1 MB/s` (`16.6 ms`) in 10-bit and `325–339 MB/s` (`11.0–16.9 ms`) in 14-bit** — a **`2.4×–3.4×` speedup** with bit-identical compressed output and `0` drops!
+  - Measured a second win: native 14-bit LJ92 (`A/M10HUF14.BIN`) compresses to `~1.00 B/px`, making it **smaller on SD than 12-bit** (`~1.07 B/px`).
+  - Unlocked 2-block CH12 DMA (`> 4 MiB` up to `8 MiB`, `lj_raw_n = 3` → 7–8 compressed slots in 48 MiB EXMEM), qualifying **9/9 target modes at `0` drops / `0` HE / `0` seam**: `1920×1440 14b` (`14.9 ms`, `70.6 MB/s`), `2048×1536 14b` (`16.9 ms`, `75.6 MB/s`), `2160×1440 14b` (`16.8 ms`, `76.3 MB/s`), `2304×1296 14b` (`16.0 ms`, `73.6 MB/s`), `2592×1088 14b` (`14.6 ms`, `71.0 MB/s`), **`Wide 1800` (`1728×1800`) full APS-C 14-bit** (`16.8 ms`, `70.2 MB/s`), `2304×1536 10b`, `2592×1440 10b`, and **`1920×1080` true 14-bit @ `30.003 fps`** (`11.0 ms`, `57.1 MB/s`)!
+- **`v186`**: rebuilt the shell into a 100% `ImgMode 1` cinema camera with a **Magic Lantern-style Size × Bit-Depth selector** (7-field HUD + opaque `14b  12b  10b` popup bar with greyed unsupported depths, instant zero-rearm bit-depth switching), generalized **10/12/14-bit** arbitrary-geometry live colour preview (`FIT` aspect ratio + `720×400` `1:1` focus zoom + 3-halfword 14-bit unpacking), balanced `LCLK_HOLD0` + `ClockSave` holds, dynamic V-blank `x_lo`, updated `tools/m10export.py`, and full ASan/UBSan test coverage (`117+` tests).

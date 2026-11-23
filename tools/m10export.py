@@ -83,18 +83,24 @@ def chunks(mlv):
     return [mlv] + extra
 
 
-M1_MIN_H = 1440            # ImgMode 1 takes (1920 x 1440, 1728 x 1440, 1728 x 1800): no x5 / Film take is this tall
+M1_MIN_H = 1440            # ImgMode 1 tall takes (>= 1440 lines): no x5 / Film take is this tall
+# Short ImgMode 1 takes (v186+, h < 1440, zero OB): exact (w, h) pairs disjoint from legacy x5 (h=1104) & Film 1x3 (h=1156/1184)
+M1_SHORT_GEOMS = frozenset({
+    (2304, 1296), (2592, 1088), (1920, 1080),
+    (1728, 1296), (1760, 1320), (1856, 1392), (2112, 1188), (1920, 1184),
+})
 WIDE_W = 1728               # ImgMode 1 Wide 1:3 window width (X0 0x30)
 WIDE_DESQ = 3               # Wide 1:3 horizontal squeeze
 
 
 def is_m1(img):
-    return img.shape[0] >= M1_MIN_H
+    h, w = img.shape[:2]
+    return h >= M1_MIN_H or (w, h) in M1_SHORT_GEOMS
 
 
 def is_wide(img):
-    """ImgMode 1 Wide 1:3 (1728 x 1800 / 1728 x 1440): 3x anamorphic, AF focus pixel lattice."""
-    return img.shape[1] == WIDE_W and img.shape[0] >= M1_MIN_H
+    """ImgMode 1 Wide 1:3 (1728 x 1800 / 1440 / 1296): 3x anamorphic, AF focus pixel lattice."""
+    return img.shape[1] == WIDE_W and is_m1(img)
 
 
 def active(img):

@@ -75,7 +75,7 @@ def recipe_fields(text: str, name: str):
 
 # ---------------------------------------------------------------------------------------------------
 class TestV183Peaking(unittest.TestCase):
-    HARNESS_KNOWN = {'pv_get10', 'pv_get12', 'pv_make_lut', 'pv_fill', 'pv_mask_opaque', 'pv_render_m1',
+    HARNESS_KNOWN = {'pv_get10', 'pv_get12', 'pv_make_lut', 'pv_fill', 'pv_m1_rect', 'pv_m1_ylim', 'pv_mask_opaque', 'pv_render_m1',
                      'pv_ok', 'pv_lut', 'pv_stat', 'pv_mode', 'pv_zebra', 'pv_clip_pct',
                      'pv_lut_r', 'pv_lut_g', 'pv_lut_b', 'pv_m1_lut_ok'}   # v184a: declared verbatim below
 
@@ -108,7 +108,8 @@ class TestV183Peaking(unittest.TestCase):
         self.assertIsNotNone(render)
         self.assertIn('0xFF00FF40', render, 'v183 focus peaking (0xFF00FF40) not in pv_render_m1 yet')
         macros, globs, helpers = self._support(text, render)
-        defs = '\n'.join(func_def(text, n) for n in ('pv_get10', 'pv_get12', 'pv_make_lut', 'pv_fill', 'pv_mask_opaque'))
+        m1_row = re.search(r'^#define\s+M1_ROW\b(?:[^\n]*\\\n)*[^\n]*', text, re.M).group(0)
+        defs = '\n'.join(func_def(text, n) for n in ('pv_get10', 'pv_get12', 'pv_make_lut', 'pv_fill', 'pv_m1_rect', 'pv_mask_opaque'))
         # v184a: fixed REC-view LUT globals, copied verbatim (pv_build_m1_luts / pv_sqrt_m1 come in as helpers)
         lut_decl = '\n'.join(re.search(p, text, re.M).group(0) for p in (
             r'^static unsigned pv_lut_r\[1024\][^\n]*', r'^static unsigned pv_m1_lut_ok\b[^\n]*'))
@@ -123,7 +124,7 @@ class TestV183Peaking(unittest.TestCase):
 #define PV_BW 360
 #define PV_BLACK 0xFF000000u
 #define PV_M1_X 46
-#define PV_M1_W 268
+#define PV_M1_W 266
 #define PV_M1_H 200
 static unsigned fake_rgba[PV_BW * 240];
 #define PV_RGBA fake_rgba
@@ -135,13 +136,17 @@ static struct {{ int buffer_width; }} camera_screen = {{ 360 }};
 static unsigned char pv_lut[1024];
 static unsigned pv_stat[3] = {{ 0, 127, 300 }};
 static volatile unsigned pv_mode = 0, pv_zebra = 1, pv_clip_pct = 0;
+static volatile unsigned sh_field = 0, sh_rec_on = 0;
+static unsigned pv_m1_ylim(void) {{ return (sh_field == 4 && !sh_rec_on) ? 200u : 220u; }}
 {globs}
 static int refresh_n = 0;
 static void vid_bitmap_refresh(void) {{ refresh_n++; }}
 static int pv_ok(void) {{ return camera_screen.buffer_width == PV_BW; }}
 {defs}
 {helpers}
+{m1_row}
 {render}
+#undef M1_ROW
 
 static void pack_row(unsigned short *dst, const unsigned *vals, unsigned n, unsigned bpp) {{
     unsigned m = (1u << bpp) - 1;
@@ -181,10 +186,10 @@ int main(void) {{
     /* 1. sharp step edge, standby (half_res = 0): green peaks in 10 and 12 bit */
     char *e10 = make_frame(10, 0, 127, 600), *e12 = make_frame(12, 0, 127 * 4, 600 * 4);
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(e10, 10, 0);
+    pv_render_m1(e10, 10, 0, 1920, 1440);
     unsigned p10 = count({PEAK_PX:#x}u);
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(e12, 12, 0);
+    pv_render_m1(e12, 12, 0, 1920, 1440);
     unsigned p12 = count({PEAK_PX:#x}u);
     printf("edge peaks 10b=%u 12b=%u\\n", p10, p12);
     assert(p10 > 0 && p12 > 0);
@@ -193,7 +198,7 @@ int main(void) {{
     /* 2. flat, low-noise frame: no peaks */
     char *fl = make_frame(10, 1, 300, 0);
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(fl, 10, 0);
+    pv_render_m1(fl, 10, 0, 1920, 1440);
     printf("flat peaks=%u\\n", count({PEAK_PX:#x}u));
     assert(count({PEAK_PX:#x}u) == 0);
 
@@ -201,7 +206,7 @@ int main(void) {{
     char *ec = make_frame(10, 0, 127, 1023);
     unsigned s0 = pv_stat[0];
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(ec, 10, 0);
+    pv_render_m1(ec, 10, 0, 1920, 1440);
     unsigned zc = count({ZEBRA_PX:#x}u);
     printf("clip zebra=%u peaks=%u\\n", zc, count({PEAK_PX:#x}u));
     assert(zc > 0);
@@ -214,10 +219,10 @@ int main(void) {{
 
     /* 4. REC (half_res = 1): peaking disabled */
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(e10, 10, 1);
+    pv_render_m1(e10, 10, 1, 1920, 1440);
     assert(count({PEAK_PX:#x}u) == 0);
     memset(fake_rgba, 0, sizeof(fake_rgba));
-    pv_render_m1(e12, 12, 1);
+    pv_render_m1(e12, 12, 1, 1920, 1440);
     assert(count({PEAK_PX:#x}u) == 0);
 
     free(e10); free(e12); free(fl); free(ec);

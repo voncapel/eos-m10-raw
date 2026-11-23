@@ -1,20 +1,22 @@
-# Handoff (`v185b`)
+# Handoff (`v186`)
 
-Where the project stands as of **22 November 2026 (`v185b`)**, what works on real hardware, what is
+Where the project stands as of **23 November 2026 (`v186`)**, what works on real hardware, what is
 open next, and the rules/workflows that save time. Read [ARCHITECTURE.md](ARCHITECTURE.md) for the
 underlying pipeline details.
 
 ---
 
-## Current state (`v185b`)
+## Current state (`v186`)
 
-- **Default mode**: `1440p 24p 10b` (`1920×1440`, `1:1`, `ImgMode 1`).
-- **Full-width modes**: `Wide 1800 10b` (`1728×1800` `1:3`, `lclk = 640`), `Wide 1440 12b` (true 12-bit 24p), `Wide 1440 10b`.
-- **14-bit mode**: `24p 2K 14b` (`2048×1076`) & `24p 1920 14b` in Canon's ×5 magnifier.
-- **Hardware-validated**:
-  - `1440p 24p 10b`: multi-minute continuous takes (`2000+` frames, 2 GiB chunk rolling), `0` drops, `0` head errors, ~16 fps live colour REC preview, instant half-press `1:1` focus zoom + peaking.
-  - `Wide 1800 10b`: `542` continuous frames (`22.6 s`), `drops = 0`, `he_n = 0`, `LJ err = 0`, `24.000 fps`, ~21 fps live `3×` desqueezed REC preview (`ren_avg = 13 ms`), and `v185b` fixed Standby `x_lo` (`37600 µs`), overlay sentinel `(358, 21)`, and `WBInteg` profile-exit guard.
-- **Host regression suite**: **42+ offline unit + ASan/UBSan C tests** covering `v167`, `hefix`, `v182`, `v183`, `v184` (576 bit-identity preview combos), and `v185/v185b` (144 Wide preview & dflush runs).
+- **100% `ImgMode 1` unified cinema shell** with **Magic Lantern-style Size × Bit-Depth HUD** (`ISO | Tv | F | SIZE | BIT | Z+P | VIEW`).
+- **Default mode**: `1920×1440 24p 14b` (`4:3`, `1:1`, optically centred `x0 = 0x84`, `14.9 ms` encode, `70.6 MB/s` SD).
+- **10 hardware-qualified sizes** (`1440 4:3`, `2K 4:3` `2048×1536`, `2.2K 3:2` `2160×1440`, `2.3K 16:9` `2304×1296`, `2.6K 2.4` `2592×1088`, `Wide 1800` `1728×1800`, `Wide 1440` `1728×1440`, `1080 30p` `1920×1080`, plus 10b-only `2.3K 3:2` `2304×1536` and `2.6K 1.8` `2592×1440`).
+- **Major breakthrough (`r161b`/`r161c`)**:
+  - **`LCLK_HOLD0` (`0xfc1803f3` / `0xfc180429`)** + **`ClockSave` (`0xfc1ec6d7` / `0xfc1ec6ed`)** accelerate `JpCore` **`2.4×–3.4×`** (`238 MB/s` in 10-bit, **`325–339 MB/s`** in 14-bit — `11.0–16.9 ms/frame`), eliminating the encoder bottleneck permanently.
+  - **2-block CH12 DMA (`> 4 MiB` up to `8 MiB`)** verified seam-free (`0` drops, `0` HE, `6/6` MLV decoded) on `1920×1440 14b` through `Wide 1800 14b` and `2592×1440 10b`.
+  - **True 14-bit (`A/M10HUF14.BIN`)** is both higher dynamic range AND lighter on SD (`~1.00 B/px`) than 12-bit (`~1.07 B/px`).
+  - **Live 10/12/14-bit colour preview** (`FIT` aspect ratio + `720×400` `1:1` focus zoom + peaking + zebras) verified under ASan/UBSan across all 10 profiles × 26 bit-depth combinations.
+- **Host regression suite**: **117 offline unit + ASan/UBSan C tests** (`test_m10_v186.py` + `v167..v185`, `hefix`, `m10export`, `task*`).
 
 ---
 
@@ -25,24 +27,22 @@ underlying pipeline details.
   meaning we can potentially capture 48 kHz 16-bit PCM directly into MLV `AUDF` blocks (and explore
   whether the codec supports an external mic / line input or internal stereo mics only).
 
-### 2. Long-take qualification of `Wide 1800 10b` & `Wide 1440 12b`
-- `Wide 1800 10b` has ~2 ms encoder headroom (`39.7 ms` avg / `41.67 ms` period; `M10_0043` had 1 busy-kick
-  collision in 302 frames, `M10_0044` had `0` in 542 frames). Qualify multi-minute takes with 2 GiB roll
-  on detailed outdoor scenes, and test `Wide 1440 12b` (`~36.6 ms` encoder) IRL as a potential default
-  full-width profile.
+### 2. Higher-framerate (`30p` / `48p` / `60p`) & SD-card-friendly 14-bit options
+- With `JpCore` running at `330 MB/s`, `1920×1080 14b @ 30.004p` takes only `11.0 ms` (`57 MB/s` SD).
+  Smaller heights (e.g. `1920×816` scope or `1600×900` @ `48p` / `60p`) are now mechanically feasible
+  subject to sensor `fl` / readout limits.
 
-### 3. Focus Pixel Map for `1440p` (`1:1`)
-- `Wide 1:3` now has exact 8-site `.fpm` maps (`card/fpm/M10_wide_1728x1800.fpm`, `1728x1440.fpm`) and
+### 3. Focus Pixel Map for `1:1` modes
+- `Wide 1:3` has exact 8-site `.fpm` maps (`card/fpm/M10_wide_1728x1800.fpm`, `1728x1440.fpm`) and
   automatic interpolation in `tools/m10export.py`.
-- `1440p` (`1920×1440` `1:1`) has a subtler `30×24` Hybrid CMOS AF II grid (mapped in `v183` probes)
-  that can be given its own optional `.fpm` map if bright flat highlights ever show it.
+- `1:1` modes have a subtler `30×24` Hybrid CMOS AF II grid that can get an optional `.fpm` map if
+  bright flat highlights ever show it.
 
 ### 4. Smaller quality-of-life items
 - Takes are capped at `XR_MAX = 3000` frames (`125 s` @ 24p); raising `XR_MAX` only requires checking BSS
-  headroom (must stay safely under ~340 KiB CHDK heap).
-- On-screen shell messages (`sh_say()`) are currently in French.
-- Optional higher-res Ximr / native Canon focus loupe (`536×400`) remains researched in reserve if the
-  half-press `1:1` overlay zoom ever feels insufficient.
+  headroom (must stay safely under ~340 KiB CHDK heap; currently `181 KiB` BSS).
+- On-screen shell toasts (`sh_say()`) are currently in French.
+- Persistent user preferences (remember last `SIZE`, `BIT`, `ISO`, `Tv` across power cycles).
 
 ---
 

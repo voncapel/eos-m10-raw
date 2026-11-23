@@ -91,7 +91,7 @@ HARNESS = r'''
 #define PV_BW 360
 #define PV_BLACK 0xFF000000u
 #define PV_M1_X 46
-#define PV_M1_W 268
+#define PV_M1_W 266
 #define PV_M1_H 200
 #define PV_HOT
 static unsigned fake_rgba[PV_BW * 240];
@@ -102,10 +102,14 @@ static void mock_flush(unsigned s, unsigned len);
 #define FN_DFLUSH ((uintptr_t)mock_flush)
 static struct { int buffer_width; } camera_screen = { 360 };
 static int refresh_n = 0;
+static volatile unsigned sh_field = 0, sh_rec_on = 0;
+static unsigned pv_m1_ylim(void) { return (sh_field == 4 && !sh_rec_on) ? 200u : 220u; }
 static void vid_bitmap_refresh(void) { refresh_n++; }
 @@DECLS@@
 static int pv_ok(void) { return camera_screen.buffer_width == PV_BW; }
 @@FUNCS@@
+#define pv_render_m1(f, b, h) pv_render_m1(f, b, h, 1920, 1440)
+#define pv_dflush_m1(p, l, m, h) pv_dflush_m1(p, l, m, h, 1920, 1440)
 
 static const unsigned PEAK = 0xFF00FF40u, ZEB = 0xFFFF2800u, SENT = 0x5A5A5A5Au;
 #define PX(x, y) fake_rgba[(20 + (y)) * PV_BW + PV_M1_X + (x)]
@@ -147,22 +151,26 @@ static char *mk(unsigned bpp, valfn f) {   /* exact-size frame: ASan catches any
     return fr;
 }
 static void sentinel(void) { for (unsigned i = 0; i < PV_BW * 240; i++) fake_rgba[i] = SENT; }
-static void outside_untouched(void) {
+static unsigned ox_of(unsigned mode) { return mode == 1 ? 0u : PV_M1_X; }
+static unsigned ow_of(unsigned mode) { return mode == 1 ? PV_BW : PV_M1_W; }
+static void outside_untouched_m(unsigned mode) {
+    unsigned ox = ox_of(mode), ow = ow_of(mode);
     for (unsigned y = 0; y < 240; y++)
         for (unsigned x = 0; x < PV_BW; x++)
-            if (y < 20 || y >= 220 || x < PV_M1_X || x >= PV_M1_X + PV_M1_W) assert(fake_rgba[y * PV_BW + x] == SENT);
+            if (y < 20 || y >= 220 || x < ox || x >= ox + ow) assert(fake_rgba[y * PV_BW + x] == SENT);
 }
+static void outside_untouched(void) { outside_untouched_m(pv_mode); }
 static unsigned cnt(unsigned v) {
-    unsigned n = 0;
-    for (unsigned y = 0; y < PV_M1_H; y++) for (unsigned x = 0; x < PV_M1_W; x++) n += PX(x, y) == v;
+    unsigned n = 0, ox = ox_of(pv_mode), ow = ow_of(pv_mode);
+    for (unsigned y = 0; y < PV_M1_H; y++) for (unsigned x = 0; x < ow; x++) n += fake_rgba[(20 + y) * PV_BW + ox + x] == v;
     return n;
 }
-static unsigned c_of(unsigned mode, unsigned st, unsigned x) { return mode == 1 ? 692 + 2 * st * x : (x * 1920 / (PV_M1_W / st)) & ~1u; }
+static unsigned c_of(unsigned mode, unsigned st, unsigned x) { return mode == 1 ? 600 + 2 * st * x : (x * 1920 / (PV_M1_W / st)) & ~1u; }
 static unsigned r_of(unsigned mode, unsigned st, unsigned y) { return mode == 1 ? 520 + 2 * st * y : (y * 1440 / (PV_M1_H / st)) & ~1u; }
 
 static void check_map(unsigned bpp, unsigned mode, int hr) {   /* exact geometry + colour of every output pixel */
     char *f = mk(bpp, v_map);
-    unsigned st = hr ? 2 : 1, W = PV_M1_W / st, H = PV_M1_H / st;
+    unsigned st = hr ? 2 : 1, ox = ox_of(mode), ow = ow_of(mode), W = ow / st, H = PV_M1_H / st;
     pv_mode = mode; pv_peak = 0; pv_zebra = 0;
     sentinel();
     pv_render_m1(f, bpp, hr);
@@ -171,7 +179,7 @@ static void check_map(unsigned bpp, unsigned mode, int hr) {   /* exact geometry
             unsigned r = r_of(mode, st, y), c = c_of(mode, st, x), s = v_map(r, c);
             unsigned e = model(s, s, s);
             for (unsigned dy = 0; dy < st; dy++)
-                for (unsigned dx = 0; dx < st; dx++) assert(PX(st * x + dx, st * y + dy) == e);
+                for (unsigned dx = 0; dx < st; dx++) assert(fake_rgba[(20 + st * y + dy) * PV_BW + ox + st * x + dx] == e);
         }
     outside_untouched();
     assert(pv_clip_pct == 0);
@@ -179,13 +187,13 @@ static void check_map(unsigned bpp, unsigned mode, int hr) {   /* exact geometry
 }
 static void check_peak_edge(unsigned bpp, unsigned mode) {
     char *f = mk(bpp, v_edge);
-    unsigned n = 0;
+    unsigned n = 0, ox = ox_of(mode), ow = ow_of(mode);
     pv_mode = mode; pv_peak = 1; pv_zebra = 1;
     sentinel();
     pv_render_m1(f, bpp, 0);
     for (unsigned y = 0; y < PV_M1_H; y++)
-        for (unsigned x = 0; x < PV_M1_W; x++)
-            if (PX(x, y) == PEAK) { n++; assert(x > 0 && y > 0); assert(c_of(mode, 1, x) >= 960 && c_of(mode, 1, x - 1) < 960); }
+        for (unsigned x = 0; x < ow; x++)
+            if (fake_rgba[(20 + y) * PV_BW + ox + x] == PEAK) { n++; assert(x > 0 && y > 0); assert(c_of(mode, 1, x) >= 960 && c_of(mode, 1, x - 1) < 960); }
     printf("edge peaks bpp=%u mode=%u n=%u\n", bpp, mode, n);
     assert(n >= PV_M1_H / 2 && n <= PV_M1_H);
     outside_untouched();
@@ -201,13 +209,13 @@ static void check_flat(unsigned bpp, unsigned mode) {
 }
 static void check_zebra(unsigned bpp, unsigned mode, unsigned zeb) {
     char *f = mk(bpp, v_clip);
-    unsigned nz = 0, fidx = pv_stat[0];
+    unsigned nz = 0, fidx = pv_stat[0], ox = ox_of(mode), ow = ow_of(mode);
     pv_mode = mode; pv_peak = 1; pv_zebra = zeb;
     sentinel();
     pv_render_m1(f, bpp, 0);
     for (unsigned y = 0; y < PV_M1_H; y++)
-        for (unsigned x = 0; x < PV_M1_W; x++) {
-            unsigned px = PX(x, y);
+        for (unsigned x = 0; x < ow; x++) {
+            unsigned px = fake_rgba[(20 + y) * PV_BW + ox + x];
             if (c_of(mode, 1, x) >= 960) {
                 assert(px != PEAK);   /* zebra (or plain white) wins over peaking on clip */
                 if (zeb && ((x + y + fidx) & 7) < 4) { assert(px == ZEB); nz++; } else assert(px != ZEB);
@@ -222,7 +230,7 @@ static void check_zebra(unsigned bpp, unsigned mode, unsigned zeb) {
 static unsigned fl_s[4096], fl_l[4096], fl_n;
 static void mock_flush(unsigned s, unsigned len) { assert(fl_n < 4096); fl_s[fl_n] = s; fl_l[fl_n] = len; fl_n++; }
 static void check_flush(unsigned bpp, unsigned mode, int hr, unsigned phys) {
-    unsigned lb = 1920 * bpp / 8, st = hr ? 2 : 1, W = PV_M1_W / st, H = PV_M1_H / st;
+    unsigned lb = 1920 * bpp / 8, st = hr ? 2 : 1, W = ow_of(mode) / st, H = PV_M1_H / st;
     size_t fsz = (size_t)1440 * lb;
     unsigned lo = phys & ~31u, hi = (unsigned)((phys + fsz + 31) & ~31u);
     unsigned char *cov = calloc(fsz, 1);
@@ -314,7 +322,7 @@ int main(void) {
         pv_peak = 0; pv_zebra = 0;
         pv_mode = 1; sentinel(); pv_render_m1(f, 10, 0);
         printf("col lut=(%u,%u,%u) px=%08x\n", R8(420), G8(380), B8(300), PX(100, 100));
-        assert(PX(100, 100) == e && cnt(e) == PV_M1_W * PV_M1_H);
+        assert(PX(100, 100) == e && cnt(e) == PV_BW * PV_M1_H);
         pv_mode = 0; sentinel(); pv_render_m1(f12, 12, 1);
         assert(cnt(e) == PV_M1_W * PV_M1_H);
         outside_untouched();
@@ -371,12 +379,17 @@ class TestV184Render(unittest.TestCase):
     def test_render_m1_asan(self):
         text = C_SRC.read_text()
         names = ('pv_get10', 'pv_get12', 'pv_sqrt_m1', 'pv_build_m1_luts', 'pv_make_lut', 'pv_fill',
-                 'pv_mask_opaque', 'pv_render_m1', 'pv_dflush_m1')
+                 'pv_m1_rect', 'pv_mask_opaque', 'pv_render_m1', 'pv_dflush_m1')
+        m1_row = re.search(r'^#define\s+M1_ROW\b(?:[^\n]*\\\n)*[^\n]*', text, re.M).group(0)
         funcs = []
         for n in names:
             d = func_def(text, n)
             self.assertIsNotNone(d, f'{n} definition not found')
+            if n == 'pv_render_m1':
+                funcs.append(m1_row)
             funcs.append(d)
+            if n == 'pv_render_m1':
+                funcs.append('#undef M1_ROW')
         decls = []
         for n in ('pv_stat', 'pv_lut', 'pv_lut_r', 'pv_m1_lut_ok', 'pv_zebra', 'pv_peak', 'pv_mode'):
             d = decl(text, n)
@@ -415,21 +428,22 @@ class TestV184Contracts(unittest.TestCase):
     def test_render_fixed_view(self):
         body = strip_comments(self.fn('pv_render_m1'))
         self.assertNotIn('pv_make_lut(', body)
-        self.assertIn('lb = 1920 * bpp / 8', body)
+        self.assertIn('lb = raw_w * bpp / 8', body)
         self.assertIn('const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;', body)
         self.assertIn('px = lr[s0] | lg[g] | lb_t[s3];', body)
         self.assertNotIn('340', body)    # v184b: no saturation multiply
         self.assertNotIn('avg2', body)   # v184b: no 2-quad average
         self.assertNotIn('255', body)    # v184b: no per-pixel clamp
         self.assertIn('col_w[x] = (unsigned short)(b >> 4);', body)
-        self.assertIn('(b12 ? 20 : 22) - (b & 15)', body)
+        self.assertIn('32 - bpp - (b & 15)', body)
         self.assertEqual(body.count('bpp == 12'), 1, 'bit depth tested once per frame')
-        i = body.index('#define M1_ROW'); row = body[i:body.index('\n    }\n', i) + 6]   # the macro body only
+        m1_row = re.search(r'^#define\s+M1_ROW\b(?:[^\n]*\\\n)*[^\n]*', self.text, re.M).group(0)
         for bad in ('bpp', '/', 'col_x', '1920'):
-            self.assertNotIn(bad, row, f'{bad} in the per-pixel loop')
+            self.assertNotIn(bad, m1_row, f'{bad} in the per-pixel loop')
         for s in ('0xFFFF2800u', '0xFF00FF40u', 'mx >= (THR)', 'mx < (THR)', 'do_peak'):
-            self.assertIn(s, row)
-        self.assertIn('if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }', body)
+            self.assertIn(s, m1_row)
+        self.assertIn('if (b14) { M1_ROW(14, 0x3fffu, 4, 16320u) }', body)
+        self.assertIn('else if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }', body)
         self.assertIn('else { M1_ROW(10, 0x3ffu, 0, 1020u) }', body)
         self.assertIn('static unsigned pv_lut_r[1024], pv_lut_g[1024], pv_lut_b[1024];', self.text)
         bl = strip_comments(self.fn('pv_build_m1_luts'))
@@ -439,7 +453,7 @@ class TestV184Contracts(unittest.TestCase):
 
     def test_dflush(self):
         d = strip_comments(self.fn('pv_dflush_m1'))
-        self.assertIn('bpp = lb / 240', d)
+        self.assertIn('bpp = lb * 8 / raw_w', d)
         self.assertIn('& ~31u', d)
         self.assertIn('FN_DFLUSH', d)
         self.assertIn('pv_dflush_m1((unsigned)lj_phys + rs * xr_fb, lvn_lb, cur_mode, hr)', v185_norm(self.fn('pv_rec_task')))
@@ -593,9 +607,9 @@ class TestV184cContracts(unittest.TestCase):
         return strip_comments(d)
 
     def test_banner(self):
-        self.assertRegex(self.text[:16], r'^/\*\n \* v18(4c|5b?) ')   # v185 / v185b banner supersedes v184c
+        self.assertRegex(self.text[:24], r'^/\*\n \* v18(4c|5b?|6\w*) ')
         st = self.fn('shell_task')
-        self.assertRegex(st, r'slog\("v18(4c|5b?) shell start", 0, 0\);')
+        self.assertRegex(st, r'slog\("v18(4c|5b?|6\w*) shell start", 0, 0\);')
         self.assertNotIn('v183d shell start', st)
 
     def test_pwr_lock_apo(self):
@@ -646,7 +660,7 @@ class TestV184cContracts(unittest.TestCase):
         body = strip_comments(func_def(self.text, 'pv_render_m1'))
         self.assertEqual(self.text.count('static PV_HOT void pv_render_m1('), 1)
         self.assertIn('else if (st == 1) {', body)
-        self.assertEqual(body.count('q[1200]'), 2)
+        self.assertEqual(body.count('q[lb_hw]'), 2)
         self.assertIn('n += (W + 3) >> 2;', body)
         self.assertEqual(body.count('if (!(x & 3)) n--;'), 2)
         i = body.index('else if (st == 1) {'); j = body.index('} else {', i); k = body.index('else { M1_ROW(10', j)
@@ -660,12 +674,12 @@ class TestV184cContracts(unittest.TestCase):
 
 
 class TestV185Dispatch(unittest.TestCase):
-    """v185: pv_m1_* forward exactly to the v184 functions outside Wide profiles (makes v185_norm sound)."""
+    """v185/v186: pv_m1_* dispatch cleanly between Wide 1:3 and 1:1 arbitrary-geometry renderers."""
     def test_dispatchers(self):
         text = C_SRC.read_text()
-        for s in ('static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full); }',
-                  'static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr); }',
-                  'static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr); }',
+        for s in ('static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full, sh_m1_w(), sh_m1_h()); }',
+                  'static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); }',
+                  'static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr, sh_m1_w(), sh_m1_h()); }',
                   'static unsigned sh_m1_wide(void) { return sh_on && sh_prof()->kind == SH_M1 && sh_prof()->m1_wide; }'):
             self.assertIn(s, text)
 

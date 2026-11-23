@@ -49,7 +49,9 @@ class TestV182Preview(unittest.TestCase):
         get12 = body_at(text, 'static inline unsigned pv_get12(')
         make_lut = body_at(text, 'static void pv_make_lut(')
         pv_fill = body_at(text, 'static void pv_fill(')
+        pv_rect = body_at(text, 'static void pv_m1_rect(')
         pv_mask = body_at(text, 'static void pv_mask_opaque(')
+        m1_row = re.search(r'^#define\s+M1_ROW\b(?:[^\n]*\\\n)*[^\n]*', text, re.M).group(0)
         render_m1 = body_at(text, 'static PV_HOT void pv_render_m1(')   # v184a: PV_HOT scheduling attribute
         # v184a: fixed REC-view LUTs used by pv_render_m1 / pv_make_lut (copied verbatim from m10_cine.c)
         lut_decl = '\n'.join(re.search(p, text, re.M).group(0) for p in (
@@ -67,7 +69,7 @@ class TestV182Preview(unittest.TestCase):
 #define PV_BW 360
 #define PV_BLACK 0xFF000000u
 #define PV_M1_X 46
-#define PV_M1_W 268
+#define PV_M1_W 266
 #define PV_M1_H 200
 
 static unsigned fake_rgba[PV_BW * 240];
@@ -76,6 +78,7 @@ static struct {{ int buffer_width; }} camera_screen = {{ 360 }};
 static unsigned char pv_lut[1024];
 static unsigned pv_stat[3] = {{ 0, 127, 300 }};
 static volatile unsigned pv_mode = 0, pv_zebra = 1, pv_peak = 0, pv_clip_pct = 0;
+static volatile unsigned sh_field = 0, sh_rec_on = 0;
 static int refresh_n = 0;
 static void vid_bitmap_refresh(void) {{ refresh_n++; }}
 static int pv_ok(void) {{ return camera_screen.buffer_width == PV_BW; }}
@@ -95,10 +98,15 @@ static void pv_make_lut(unsigned black, unsigned mean)
 {make_lut}
 static void pv_fill(unsigned y0, unsigned y1, unsigned x0, unsigned x1, unsigned v)
 {pv_fill}
-static void pv_mask_opaque(int full)
+static void pv_m1_rect(unsigned raw_w, unsigned raw_h, unsigned *out_x, unsigned *out_y, unsigned *out_w, unsigned *out_h)
+{pv_rect}
+static unsigned pv_m1_ylim(void) {{ return (sh_field == 4 && !sh_rec_on) ? 200u : 220u; }}
+static void pv_mask_opaque(int full, unsigned raw_w, unsigned raw_h)
 {pv_mask}
-static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
+{m1_row}
+static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res, unsigned raw_w, unsigned raw_h)
 {render_m1}
+#undef M1_ROW
 
 static void pack_row_10(unsigned short *dst, const unsigned *vals, unsigned n) {{
     memset(dst, 0, n * 10 / 8);
@@ -160,8 +168,8 @@ int main(void) {{
     pv_make_lut(127, 300);
     memset(fake_rgba, 0, sizeof(fake_rgba));
     pv_mode = 0;
-    pv_mask_opaque(0);
-    pv_render_m1(f10, 10, 0);
+    pv_mask_opaque(0, 1920, 1440);
+    pv_render_m1(f10, 10, 0, 1920, 1440);
 
     /* Opaque pillarboxes and opaque image window */
     for (unsigned y = 20; y < 220; y++) {{
@@ -179,21 +187,21 @@ int main(void) {{
     assert(pv_clip_pct >= 20 && pv_clip_pct <= 30);
 
     /* Half-res 2x2 REC preview */
-    pv_render_m1(f10, 10, 1);
+    pv_render_m1(f10, 10, 1, 1920, 1440);
     unsigned px_h = fake_rgba[(20 + 40) * PV_BW + (PV_M1_X + 50)];
     assert(px_h == fake_rgba[(20 + 41) * PV_BW + (PV_M1_X + 51)]);
     assert(((px_h >> 16) & 0xff) > 150);
 
     /* 1:1 focus zoom mode */
     pv_mode = 1;
-    pv_render_m1(f10, 10, 0);
+    pv_render_m1(f10, 10, 0, 1920, 1440);
     for (unsigned y = 20; y < 220; y++)
         for (unsigned x = PV_M1_X; x < PV_M1_X + PV_M1_W; x++)
             assert((fake_rgba[y * PV_BW + x] >> 24) == 0xFF);
 
     /* OFF mode */
     pv_mode = 2;
-    pv_mask_opaque(1);
+    pv_mask_opaque(1, 1920, 1440);
     for (unsigned y = 20; y < 220; y++)
         for (unsigned x = 0; x < PV_BW; x++)
             assert(fake_rgba[y * PV_BW + x] == PV_BLACK);
@@ -210,15 +218,15 @@ int main(void) {{
     }}
     pv_mode = 0;
     pv_make_lut(127, 300);
-    pv_render_m1(f12, 12, 1);
+    pv_render_m1(f12, 12, 1, 1920, 1440);
     unsigned px12 = fake_rgba[(20 + 100) * PV_BW + (PV_M1_X + 100)];
     assert(((px12 >> 16) & 0xff) > 150 && ((px12 >> 8) & 0xff) == 0 && (px12 & 0xff) == 0);
 
     /* HDMI guard */
     memset(fake_rgba, 0x55, sizeof(fake_rgba));
     camera_screen.buffer_width = 480;
-    pv_mask_opaque(1);
-    pv_render_m1(f10, 10, 0);
+    pv_mask_opaque(1, 1920, 1440);
+    pv_render_m1(f10, 10, 0, 1920, 1440);
     assert(fake_rgba[30 * PV_BW + 2] == 0x55555555u);
 
     free(f10);

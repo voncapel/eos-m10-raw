@@ -1,8 +1,9 @@
-# Architecture (`v185b`)
+# Architecture (`v186`)
 
-How a RAW frame gets from the Canon EOS M10 sensor to an `.MLV` file — covering both the
-**`ImgMode 1` continuous pipeline** (`1440p 1:1`, `Wide 1800`, `Wide 1440` — `v180–v185b`) and
-the **×5 magnifier 14-bit pipeline** (`2K DCI` — `v160–v176`).
+How a RAW frame gets from the Canon EOS M10 sensor to an `.MLV` file — using the unified
+**`ImgMode 1` continuous pipeline** (`v180–v186`: 10 hardware-qualified `1:1` and `Wide 1:3`
+geometries at 24p & 30p, **14-bit / 12-bit / 10-bit** native, accelerated **`3.3×`** by Canon's
+`LCLK_HOLD0` API).
 
 All firmware addresses below are for **EOS M10 `1.10d`** unless marked `110f`.
 
@@ -93,23 +94,39 @@ uses Canon's full-sensor readout path and has no such wall.
      passed from C via `SH_IPC_ARG_OFF = 0x280` — fixes the 1-in-3 head error caused by `ChangeMode`
      resetting `[0xfc3c]` to `24`.
 
-### `ImgMode 1` profiles (`v185b`)
+### `ImgMode 1` profiles (`v186` — optically centred, Magic Lantern Size × Bit-Depth)
 
-| Profile | `W × H` | `HH` | `X0` | `LCLK` | `FL` | `PER (µs)` | `CMOS[2/5/7]` | `[0xfc3c]` | `x_lo (µs)` | Raw Frame |
+Optical centring rule (`CMOS[5] = 0x300`, active sensor cols `1308..3900`): `x0 = 0x30 + (2592 − W) / 8`,
+respecting Canon's ROM head margin `x1 = x0 + W/4 ≤ lclk − 54`.
+
+| Size | `W × H` | `FPS` | `X0` | `LCLK` | `FL` | `CMOS[2/5/7]` | `[0xfc3c]` | `x_lo (µs)` | Depths (`bpp_mask`) | 14b Raw / `JpCore` (`HOLD0`) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `1440p 24p 10b` | `1920×1440` | `1456` | `0x34` | `732` | `1819` | `41666` | `— / 0x300 / 0xae9` | `2073` | `35166` | `3.30 MiB` |
-| `1440p 24p 12b` | `1920×1440` | `1456` | `0x34` | `732` | `1819` | `41666` | `— / 0x300 / 0xae9` | `2073` | `35166` | `3.96 MiB` |
-| `Wide 1800 10b` | `1728×1800` | `1816` | `0x30` | `640` | `2080` | `41665` | `0x742 / 0x020 / 0xac6` | `1713` | `37600` | `3.71 MiB` |
-| `Wide 1440 12b` | `1728×1440` | `1456` | `0x30` | `732` | `1819` | `41666` | `0x742 / 0x020 / 0xae9` | `2073` | `35166` | `3.56 MiB` |
-| `Wide 1440 10b` | `1728×1440` | `1456` | `0x30` | `732` | `1819` | `41666` | `0x742 / 0x020 / 0xae9` | `2073` | `35166` | `2.97 MiB` |
+| `1440 4:3` | `1920×1440` | `24.000` | `0x84` | `732` | `1819` | `— / 0x300 / 0xac9` | `2073` | `35166` | `14 / 12 / 10` | `4.84 MB` / `14.9 ms` (`325 MB/s`) |
+| `2K 4:3` | `2048×1536` | `24.000` | `0x74` | `732` | `1819` | `— / 0x300 / 0xac9` | `1977` | `36884` | `14 / 12 / 10` | `5.51 MB` / `16.9 ms` (`327 MB/s`) |
+| `2.2K 3:2` | `2160×1440` | `24.000` | `0x66` | `732` | `1819` | `— / 0x300 / 0xac9` | `2073` | `35166` | `14 / 12 / 10` | `5.44 MB` / `16.8 ms` (`324 MB/s`) |
+| `2.3K 169` | `2304×1296` | `24.000` | `0x54` | `732` | `1819` | `— / 0x300 / 0xa89` | `2217` | `35166` | `14 / 12 / 10` | `5.23 MB` / `16.0 ms` (`327 MB/s`) |
+| `2.6K 2.4` | `2592×1088` | `24.006` | `0x30` | `750` | `1775` | `— / 0x300 / 0xa69` | `2425` | `35166` | `14 / 12 / 10` | `4.94 MB` / `14.6 ms` (`339 MB/s`) |
+| `Wide1800` | `1728×1800` | `24.001` | `0x30` | `640` | `2080` | `0x742 / 0x020 / 0xac6` | `1713` | `37618` | `14 / 12 / 10` | `5.44 MB` / `16.8 ms` (`325 MB/s`) |
+| `Wide1440` | `1728×1440` | `24.000` | `0x30` | `732` | `1819` | `0x742 / 0x020 / 0xac9` | `2073` | `35166` | `14 / 12 / 10` | `4.35 MB` / `~13.4 ms` |
+| `1080 30p` | `1920×1080` | `30.004` | `0x84` | `732` | `1455` | `— / 0x300 / 0xa8a` | `2433` | `28828` | `14 / 12 / 10` | `3.63 MB` / `11.0 ms` (`332 MB/s`) |
+| `2.3K 3:2` | `2304×1536` | `24.000` | `0x54` | `732` | `1819` | `— / 0x300 / 0xac9` | `1977` | `36884` | `10` only | `4.42 MB` (10b) / `18.6 ms` |
+| `2.6K 1.8` | `2592×1440` | `24.006` | `0x30` | `750` | `1775` | `— / 0x300 / 0xac9` | `2073` | `35522` | `10` only | `4.67 MB` (10b) / `19.6 ms` |
 
-Every raw frame fits inside a **single `< 4 MiB` EDMAC CH12 transfer**. In `Wide 1800`, active readout
-ends at `(32 + 1816) × 641 / 32 = 37,018 µs`, so both Standby and REC arm CH12 at `x_lo = 37,600 µs`
-(safely inside V-blank before `hi = 40,465 µs`).
+- **2-block CH12 DMA (`> 4 MiB`, up to `8 MiB`)**: when `xr_fb > 0x00400000`, `ch12_arm()` splits the
+  transfer into 2 seamless EDMAC blocks (`yn = 1`, `b1 = H/2`, `b2 = H - b1`), each `≤ 4 MiB`. Both
+  `FN_LL_SETUP` (14-bit) and `FN_LL_RD1` (`0xfc581e31`, 10/12-bit) read `> 4 MiB` frames natively.
+  For `> 4 MiB` frames, `lj_raw_n` stays at `3` (since `LCLK_HOLD0` encodes in `< 17 ms`) and 14-bit
+  compressed slots size to `0.80 × enc_fb`, yielding **7–8 compressed slots** (~300 ms SD write buffer).
+- **`LCLK_HOLD0` + `ClockSave` turbo clock holds (`v186`)**: in `lv_x3()`, whenever `lj_on == 1`,
+  `m10cine.flt` acquires Canon's zero-arg refcounted **`LCLK_HOLD0` (`0xfc1803f3`)** (dropping `LclkChg`
+  from level `1` → `0`, raising `JpCore` from ~`100 MB/s` to **`238 MB/s` in 10-bit / `325–339 MB/s`
+  in 14-bit**) plus **`ClockSave` gear-A (`0xfc1ec6d7`)** (prevents `WFI` down-clocking during standalone
+  unplugged takes), and releases both symmetrically (`0xfc1ec6ed`, `0xfc180429`) on every exit path.
+- **Dynamic V-blank `x_lo`**: computed for both Standby and REC from `ro_end = ceil((32 + H + 16) × (lclk + 1) / 32)`.
 
 ---
 
-## 2. Live Colour Preview (`v184c` / `v185b`)
+## 2. Live Colour Preview (`v184c` / `v186`)
 
 In `ImgMode 1`, Canon's own YUV display pipeline has broken geometry (showing magenta/green bars).
 The module covers the entire `360×240` RGBA overlay (`PV_RGBA`, `0xAARRGGBB`) with an opaque black mask
@@ -117,20 +134,25 @@ and renders our own colour preview directly from the captured RAW ring:
 
 - **Compiled hot path**: `PV_HOT = __attribute__((optimize("O2","schedule-insns2")))` built with
   **`-mword-relocations`** (prevents ARM `MOVW/MOVT` reloc 47 errors in CHDK `.flt` files).
-- **Pre-shifted u32 LUTs**: `pv_lut_r/g/b[1024]` bake black level (`127`), Rec.709 S-curve, and
-  daylight WB (`R×1.75`, `B×1.50`) straight into `0xAARRGGBB` lanes (`px = lr[R] | lg[G] | lb[B]`).
-- **Cached reads + selective `dcache_flush_range` (`0xfc1267af`)**: only the sampled row pairs are
-  invalidated before reading, yielding `fl_avg = 0–1 ms`.
-- **Two dedicated renderers**:
-  - `pv_render_m1` (`1:1` `1440p`): `268×200` (`4:3`) or `1:1` centre `536×400` punch-in with green
-    focus peaking and zebras.
-  - `pv_render_m1_wide` (`Wide 1:3`): `360×124` (`1800p`) or `360×100` (`1440p`) horizontally desqueezed `3×`
-    with `2.39:1` cinemascope framing ticks, or `360×200` desqueezed `1:1` centre focus zoom with peaking.
-- **Standby (`M10PvS`)**: async 8-slot EXMEM ring (`ns = 8`, ~350 ms wrap margin → `torn = 0`).
-- **REC (`M10Pv`)**: reads `xr_prod - 1` under seqlock (`hr = 1` half-res in full frame, `13–22 ms`,
-  ~16–21 fps live REC preview; automatically upgrades to full-res `1:1` + peaking on half-press when encoder backlog `< 2`).
-- **Overlay wipe sentinel**: checks `PV_RGBA[21 * PV_BW + 358]` (top-right corner of mask, clear of
-  the clip-percentage text at `(2, 22)`) and `PV_RGBA[1 * PV_BW + 358]` in full-height Wide `1:1` view.
+- **10-bit, 12-bit, AND 14-bit live preview**: pre-shifted u32 LUTs (`pv_lut_r/g/b[1024]`, Rec.709
+  S-curve + daylight WB `R×1.75` / `B×1.50`) accept 10-bit directly, 12-bit via `>> 2`, and **14-bit via
+  `>> 4`** (using separate `col_w/col_sh` and `col_w1/col_sh1` tables because adjacent 14-bit samples
+  can span 3 halfwords). Zebras trigger at `≥ 1020` / `4080` / `16320`.
+- **Cached reads + selective `dcache_flush_range` (`0xfc1267af`)**: only the sampled row pairs of
+  `(raw_w, raw_h)` are invalidated before reading (`fl_avg = 0–1 ms`).
+- **Two generalized renderers**:
+  - `pv_render_m1` (`1:1` arbitrary `W × H`): `FIT` computes an aspect-correct even rect centered in
+    `360×200` with opaque pillarbox/letterbox masks; `1:1` zooms the centered `720×400` photosites to
+    full-width `360×200` with green focus peaking.
+  - `pv_render_m1_wide` (`Wide 1:3`): `360×124` (`1800p`) or `360×100` (`1440p`) horizontally desqueezed
+    `3×` with `2.39:1` cinemascope framing ticks, or `360×200` desqueezed `1:1` centre focus zoom.
+- **Magic Lantern `BIT` bar guard**: when the `BIT` selector bar (`rows 200..219`) is open in Standby
+  (`sh_field == 4 && !sh_rec_on`), `pv_m1_ylim()` clamps rendering to `row 200` so live video never
+  overwrites the `14b  12b  10b` strip.
+- **Standby (`M10PvS`) & REC (`M10Pv`)**: async 8-slot Standby ring (`torn = 0`) + continuous live REC
+  preview (`xr_prod - 1` under seqlock, auto-upgrades to full-res `1:1` + peaking on half-press).
+- **Overlay wipe sentinel**: `pv_stby_task` watches `PV_RGBA[1 * PV_BW + 358]` (opaque top HUD bar) for
+  all `ImgMode 1` modes so full-width `16:9` / `2.38:1` / `1:1` images never trigger false wipe loops.
 
 ---
 

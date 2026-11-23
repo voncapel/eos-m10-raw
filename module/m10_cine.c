@@ -390,6 +390,18 @@ typedef unsigned (*fn1)(unsigned);
 typedef unsigned (*fn2)(unsigned, unsigned);
 typedef unsigned (*fn3)(unsigned, unsigned, unsigned);
 
+// v186a: Canon zero-arg refcounted clock holds (1.10d, Thumb): LCLK hold/release + clock-save take/release
+#define FN_LCLK_HOLD0   0xfc1803f3
+#define FN_LCLK_REL0    0xfc180429
+#define FN_CLKSAVE_TAKE 0xfc1ec6d7
+#define FN_CLKSAVE_REL  0xfc1ec6ed
+#ifdef M10_HOST_TEST
+static unsigned m10_fw0_stub(unsigned a) { (void)a; return 0; }   // host tests: never call ROM addresses
+#define FW0(a) m10_fw0_stub(a)
+#else
+#define FW0(a) (((fn0)(a))())
+#endif
+
 #define REG(a) (*(volatile unsigned *)(a))
 
 static void eng_out(unsigned reg, unsigned val) { ((fn2)FN_ENGDRV_OUT)(reg, val); }
@@ -3804,28 +3816,44 @@ typedef struct {
     unsigned short h;              // v185: ImgMode 1 frame lines (head = h + 16)
     unsigned short lclk;           // v185: ImgMode 1 TG line clock
     unsigned char m1_wide;         // v185: 1 = wide ImgMode 1 window (X0 0x30, CMOS 2/5/7 wide)
+    unsigned short x0;             // v186b: ImgMode 1 CMOS X0 (window start)
+    unsigned short c7;             // v186b: ImgMode 1 CMOS[7]
+    unsigned char bpp_mask;        // v186b: supported depths: 1 = 10b, 2 = 12b, 4 = 14b
+    const char *short_tag;         // v186b: 8-char SIZE label for the bottom bar
 } sh_prof_t;
 #define SH_X5 0
 #define SH_X3 1
 #define SH_M1 2
-static const sh_prof_t sh_profs[] = {
-    { 24, 10, 0x10, SH_M1, 1819, 41666, 0, 1920, "1440p 24p 10b", 1440, 732, 0 },   // v182: ImgMode 1 1920x1440 1:1 (r159), default
-    { 24, 12, 0x10, SH_M1, 1819, 41666, 0, 1920, "1440p 24p 12b", 1440, 732, 0 },   // v182: same, 12-bit (~22 fps encoder)
-    { 24, 10, 0x10, SH_M1, 2080, 41665, 0, 1728, "Wide 1800 10b", 1800, 640, 1 },   // v185: wide ImgMode 1 1728x1800
-    { 24, 12, 0x10, SH_M1, 1819, 41666, 0, 1728, "Wide 1440 12b", 1440, 732, 1 },   // v185: wide ImgMode 1 1728x1440 12-bit
-    { 24, 10, 0x10, SH_M1, 1819, 41666, 0, 1728, "Wide 1440 10b", 1440, 732, 1 },   // v185: wide ImgMode 1 1728x1440 10-bit
-    { 25, 12, 0x22, SH_X3, 2000, 40000, 136, 1536, "1x3 25p 12b", 0, 0, 0 },   // v178: Film 1x3 full APS-C width, 12-bit PREFIFO, line 640 (r147/r149)
-    { 24, 14, 0x10, 0, 1819, 41666, 304, 2048, "24p 2K 14b", 0, 0, 0 },   // 1.90:1 2K DCI 14-bit (0x10 HEAD, 1.00x unity)
-    { 24, 14, 0x10, 0, 1819, 41666, 368, 1920, "24p 1920 14b", 0, 0, 0 },   // 1.78:1 16:9 14-bit (0x10 HEAD)
-    { 25, 14, 0x10, 0, 1747, 40017, 368, 1920, "25p 1920 14b", 0, 0, 0 },   // 1.78:1 25p 14-bit (0x10 HEAD)
-    { 24, 10, 0x00, 0, 1819, 41666, 192, 2304, "24p 2304 10b", 0, 0, 0 },   // 2.14:1 cinema 10-bit
-    { 24, 10, 0x00, 0, 1819, 41666,  80, 2512, "24p 2512 10b", 0, 0, 0 },   // 2.33:1 max active 10-bit
-    { 24, 10, 0x00, 0, 1819, 41666, 304, 2048, "24p 2048 10b", 0, 0, 0 },
-    { 24, 10, 0x00, 0, 1819, 41666, 368, 1920, "24p 1920 10b", 0, 0, 0 },
-    { 25, 10, 0x00, 0, 1747, 40017, 192, 2304, "25p 2304 10b", 0, 0, 0 },   // 25.00p PAL legacy 10-bit
+static const sh_prof_t sh_profs[] = {   // v186b: Magic Lantern-style Size x Bit-Depth, 100% ImgMode 1
+    { 24, 14, 0x10, SH_M1, 1819, 41666, 0, 1920, "1920x1440 24p", 1440, 732, 0, 0x84, 0xac9, 7, "1440 4:3" },
+    { 24, 14, 0x10, SH_M1, 1819, 41666, 0, 2048, "2048x1536 24p", 1536, 732, 0, 0x74, 0xac9, 7, "2K 4:3" },
+    { 24, 14, 0x10, SH_M1, 1819, 41666, 0, 2160, "2160x1440 24p", 1440, 732, 0, 0x66, 0xac9, 7, "2.2K 3:2" },
+    { 24, 14, 0x10, SH_M1, 1819, 41666, 0, 2304, "2304x1296 24p", 1296, 732, 0, 0x54, 0xa89, 7, "2.3K 169" },
+    { 24, 14, 0x10, SH_M1, 1775, 41657, 0, 2592, "2592x1088 24p", 1088, 750, 0, 0x30, 0xa69, 7, "2.6K 2.4" },
+    { 24, 14, 0x10, SH_M1, 2080, 41665, 0, 1728, "Wide 1800 24p", 1800, 640, 1, 0x30, 0xac6, 7, "Wide1800" },
+    { 24, 14, 0x10, SH_M1, 1819, 41666, 0, 1728, "Wide 1440 24p", 1440, 732, 1, 0x30, 0xac9, 7, "Wide1440" },
+    { 30, 14, 0x10, SH_M1, 1455, 33328, 0, 1920, "1920x1080 30p", 1080, 732, 0, 0x84, 0xa8a, 7, "1080 30p" },
+    { 24, 10, 0x10, SH_M1, 1819, 41666, 0, 2304, "2304x1536 24p", 1536, 732, 0, 0x54, 0xac9, 1, "2.3K 3:2" },
+    { 24, 10, 0x10, SH_M1, 1775, 41657, 0, 2592, "2592x1440 24p", 1440, 750, 0, 0x30, 0xac9, 1, "2.6K 1.8" },
 };
 #define SH_NPROF (sizeof(sh_profs) / sizeof(sh_profs[0]))
 static volatile unsigned sh_prof_idx = 0, sh_armed_fps = 0;
+static volatile unsigned sh_field = 0;   // v186b: HUD bottom-bar field (moved up)
+static volatile unsigned sh_bpp = 14;   // v186b: selected bit depth (10/12/14), independent of the SIZE profile
+static int sh_bpp_ok(const sh_prof_t *pr, unsigned bpp) { unsigned b = bpp == 10 ? 1u : bpp == 12 ? 2u : bpp == 14 ? 4u : 0u; return (pr->bpp_mask & b) != 0; }
+static void sh_bpp_clamp(const sh_prof_t *pr)   // highest supported depth if the current one is not
+{
+    if (sh_bpp_ok(pr, sh_bpp)) return;
+    sh_bpp = sh_bpp_ok(pr, 14) ? 14 : sh_bpp_ok(pr, 12) ? 12 : 10;
+}
+static void sh_bpp_step(const sh_prof_t *pr, int dir)   // dir > 0: 14 -> 12 -> 10, dir < 0: 10 -> 12 -> 14 (skips unsupported)
+{
+    unsigned b = sh_bpp;
+    for (;;) {
+        if (dir > 0) { if (b <= 10) return; b -= 2; } else { if (b >= 14) return; b += 2; }
+        if (sh_bpp_ok(pr, b)) { sh_bpp = b; return; }
+    }
+}
 static volatile unsigned sh_x3_ok = 0;   // v178: Film 1x3 armed and running
 static volatile unsigned pv_zebra = 1, pv_clip_pct = 0;
 static volatile unsigned pv_peak = 1;   // v183: focus peaking (standby full-res preview only), default ON
@@ -3837,7 +3865,7 @@ static int sh_is_m1(void) { return sh_on && sh_prof()->kind == SH_M1; }
 static unsigned sh_m1_w(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->w ? p->w : 1920; }
 static unsigned sh_m1_h(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->h ? p->h : 1440; }
 static unsigned sh_m1_head_h(void) { return sh_m1_h() + 16; }
-static unsigned sh_m1_x0(void) { return (sh_prof()->kind == SH_M1 && sh_prof()->m1_wide) ? 0x30u : 0x34u; }
+static unsigned sh_m1_x0(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->x0 ? p->x0 : 0x84u; }   // v186b: per-profile X0
 static unsigned sh_m1_lclk(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->lclk ? p->lclk : 732; }
 static unsigned sh_m1_fl(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->fl ? p->fl : 1819; }
 static unsigned sh_m1_per(void) { const sh_prof_t *p = sh_prof(); return p->kind == SH_M1 && p->per ? p->per : 41666; }
@@ -3922,14 +3950,35 @@ static void pv_clear(void)
 /* v182 (B.2/B.3): in ImgMode 1 Canon's YUV view shows magenta / green / cyan bars through every transparent
  * overlay pixel. Rows 20..219 are made opaque black outside the 268 x 200 image window (x 46..313), or
  * entirely (full = 1, view OFF, no image yet); the HUD bars (rows 0..19, 220..239) are drawn opaque by sh_hud. */
-#define PV_M1_X 46
-#define PV_M1_W 268
-#define PV_M1_H 200
-static void pv_mask_opaque(int full)
+/* v186b: aspect-fit even rect of a raw_w x raw_h frame inside the 360 x 200 image area (rows 20..219) */
+static void pv_m1_rect(unsigned raw_w, unsigned raw_h, unsigned *out_x, unsigned *out_y, unsigned *out_w, unsigned *out_h)
 {
+    unsigned w = PV_BW, h = 200;
+    if (raw_w && raw_h) {
+        h = PV_BW * raw_h / raw_w;
+        if (h > 200) { h = 200; w = 200 * raw_w / raw_h; if (w > PV_BW) w = PV_BW; }
+    }
+    w &= ~1u; h &= ~1u;
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+    *out_w = w; *out_h = h;
+    *out_x = ((PV_BW - w) / 2) & ~1u;
+    *out_y = 20 + (((200 - h) / 2) & ~1u);
+}
+/* v186b: rows the ImgMode 1 renderers may write (the BIT selector bar owns rows 200..219 while it is shown) */
+static unsigned pv_m1_ylim(void) { return (sh_field == 4 && !sh_rec_on) ? 200u : 220u; }
+static void pv_mask_opaque(int full, unsigned raw_w, unsigned raw_h)
+{
+    unsigned ox, oy, ow, oh;
     if (!pv_ok()) return;
     if (full || pv_mode == 2) pv_fill(20, 220, 0, PV_BW, PV_BLACK);
-    else { pv_fill(20, 220, 0, PV_M1_X, PV_BLACK); pv_fill(20, 220, PV_M1_X + PV_M1_W, PV_BW, PV_BLACK); }
+    else {
+        pv_m1_rect(raw_w, raw_h, &ox, &oy, &ow, &oh);
+        if (oy > 20) pv_fill(20, oy, 0, PV_BW, PV_BLACK);
+        if (oy + oh < 220) pv_fill(oy + oh, 220, 0, PV_BW, PV_BLACK);
+        if (ox) pv_fill(oy, oy + oh, 0, ox, PV_BLACK);
+        if (ox + ow < PV_BW) pv_fill(oy, oy + oh, ox + ow, PV_BW, PV_BLACK);
+    }
     vid_bitmap_refresh();
 }
 static void pv_mask_clear(void)   // leaving ImgMode 1: Canon's own view (x5 / Film) visible again
@@ -3947,37 +3996,19 @@ static inline unsigned pv_get12(const volatile unsigned short *p, unsigned c)   
     unsigned b = c * 12, w = b >> 4, v = ((unsigned)p[w] << 16) | p[w + 1];
     return (v >> (20 - (b & 15))) & 0xfff;
 }
-/* v182 (B.4) / v184a / v184b: ImgMode 1 colour preview. Frame 1920 x 1440 PACK32 (10 or 12 bit), RGGB from (0,0)
- * (X0 = 0x34, Y0 = 32, both even), no optical black in the window: fixed black 127 (10b scale; 12b samples >> 2).
- * pv_mode 0: whole frame 4:3 -> 268 x 200 (one quad per pixel); 1: centre 536 x 400 at one photosite per LCD dot.
- * half_res (REC): 134 x 100 quads, each written as a 2 x 2 block. v184b: per-column word / shift tables, one inner
- * loop per bit depth (no bpp test per pixel), px = lr[R] | lg[G] | lb[B] (pre-shifted u32 LUTs, no saturation pass),
- * output-grid peaking (left + upper output pixel) and zebra unchanged. No refresh here. */
-static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
-{
-    const unsigned mode = pv_mode, zebra = pv_zebra, peak = pv_peak, fidx = pv_stat[0];   // v184a: hoisted (volatile globals)
-    const unsigned black = 127, focus = (mode == 1), st = half_res ? 2 : 1;
-    const unsigned W = PV_M1_W / st, H = PV_M1_H / st, lb = 1920 * bpp / 8;
-    const int do_peak = peak && !half_res, b12 = (bpp == 12);
-    const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;   // v184b: hoisted LUT bases
-    unsigned x, y, sum = 0, n = 0, clip = 0;
-    static unsigned short pk_prev[PV_M1_W];   // v183: previous output row green (10b scale)
-    static unsigned short col_w[PV_M1_W];      // v184b: first 16-bit word of quad column c (b = c * bpp, b >> 4)
-    static unsigned char col_sh[PV_M1_W];      // v184b: right shift of sample c inside its 32-bit window
-    static unsigned row_px[PV_M1_W];           // v183d: cached row, burst-copied to uncached PV_RGBA (never reentrant)
-    if (!pv_ok() || mode == 2) return;
-    if (!pv_m1_lut_ok) pv_build_m1_luts();
-    for (x = 0; x < W; x++) {
-        unsigned c = focus ? 692 + 2 * st * x : (x * 1920 / W) & ~1u, b = c * bpp;
-        col_w[x] = (unsigned short)(b >> 4);
-        col_sh[x] = (unsigned char)((b12 ? 20 : 22) - (b & 15));   // c even: b & 15 in {0,4,8,12} (10b) / {0,8} (12b)
-    }
-    /* v184b: one row of quads at bit depth D (mask M, 12b -> 10b scale >> SC, zebra / clip threshold THR on raw samples) */
+/* v182 (B.4) / v184a / v184b / v186b: ImgMode 1 colour preview. Frame raw_w x raw_h PACK32 (10, 12 or 14 bit), RGGB
+ * from (0,0) (X0 / Y0 even), no optical black in the window: fixed black 127 (10b scale; 12b >> 2, 14b >> 4).
+ * pv_mode 0: whole frame aspect-fit (pv_m1_rect) in 360 x 200 (one quad per pixel); 1: centre 720 x 400 photosites
+ * -> 360 x 200 at one quad per LCD dot. half_res (REC): quads written as 2 x 2 blocks. v184b: per-column word / shift
+ * tables, one inner loop per bit depth (no bpp test per pixel), px = lr[R] | lg[G] | lb[B] (pre-shifted u32 LUTs).
+ * v186b: the second sample of a quad has its own word / shift (col_w1 / col_sh1): a 14b pair spans up to 3 halfwords.
+ * Rows >= pv_m1_ylim() are left alone (BIT selector bar). No refresh here. */
 #define M1_ROW(D, M, SC, THR) \
     for (x = 0; x < W; x++) { \
-        const unsigned w = col_w[x], sh = col_sh[x]; \
+        const unsigned w = col_w[x], sh = col_sh[x], w1 = col_w1[x], sh1 = col_sh1[x]; \
         const unsigned v0 = ((unsigned)p0[w] << 16) | p0[w + 1], v1 = ((unsigned)p1[w] << 16) | p1[w + 1]; \
-        unsigned s0 = (v0 >> sh) & (M), s1 = (v0 >> (sh - (D))) & (M), s2 = (v1 >> sh) & (M), s3 = (v1 >> (sh - (D))) & (M); \
+        const unsigned u0 = ((unsigned)p0[w1] << 16) | p0[w1 + 1], u1 = ((unsigned)p1[w1] << 16) | p1[w1 + 1]; \
+        unsigned s0 = (v0 >> sh) & (M), s1 = (u0 >> sh1) & (M), s2 = (v1 >> sh) & (M), s3 = (u1 >> sh1) & (M); \
         unsigned mx = s0 > s1 ? s0 : s1, m2 = s2 > s3 ? s2 : s3, px, g; \
         mx = mx > m2 ? mx : m2; \
         s0 >>= (SC); s1 >>= (SC); s2 >>= (SC); s3 >>= (SC); \
@@ -3996,25 +4027,54 @@ static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
         if (do_peak) { pk_prev[x] = (unsigned short)g; g_left = g; } \
         if (st == 2) { row_px[2 * x] = px; row_px[2 * x + 1] = px; } \
         else row_px[x] = px; \
+        (void)(D); \
+    }
+static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res, unsigned raw_w, unsigned raw_h)
+{
+    const unsigned mode = pv_mode, zebra = pv_zebra, peak = pv_peak, fidx = pv_stat[0];   // v184a: hoisted (volatile globals)
+    const unsigned black = 127, st = half_res ? 2 : 1, ylim = pv_m1_ylim();
+    const int do_peak = peak && !half_res, b12 = (bpp == 12), b14 = (bpp == 14);
+    const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;   // v184b: hoisted LUT bases
+    unsigned focus = (mode == 1), ox, oy, ow, oh, W, H, lb, lb_hw, c0 = 0, r0 = 0;
+    unsigned x, y, sum = 0, n = 0, clip = 0, rows = 0;
+    static unsigned short pk_prev[PV_BW];   // v183: previous output row green (10b scale)
+    static unsigned short col_w[PV_BW], col_w1[PV_BW];   // v184b / v186b: first 16-bit word of quad samples c / c + 1
+    static unsigned char col_sh[PV_BW], col_sh1[PV_BW];  // v184b / v186b: right shifts inside their 32-bit windows
+    static unsigned row_px[PV_BW];           // v183d: cached row, burst-copied to uncached PV_RGBA (never reentrant)
+    if (!pv_ok() || mode == 2 || !raw_w || !raw_h) return;
+    if (bpp != 10 && bpp != 12 && bpp != 14) return;
+    if (!pv_m1_lut_ok) pv_build_m1_luts();
+    if (focus && (raw_w < 2 * PV_BW || raw_h < 400)) focus = 0;
+    if (focus) { ox = 0; oy = 20; ow = PV_BW; oh = 200; c0 = ((raw_w - 2 * PV_BW) / 2) & ~1u; r0 = ((raw_h - 400) / 2) & ~1u; }
+    else pv_m1_rect(raw_w, raw_h, &ox, &oy, &ow, &oh);
+    W = ow / st; H = oh / st; lb = raw_w * bpp / 8; lb_hw = lb >> 1;
+    for (x = 0; x < W; x++) {
+        unsigned c = focus ? c0 + 2 * st * x : (x * raw_w / W) & ~1u, b = c * bpp, b1 = b + bpp;
+        col_w[x] = (unsigned short)(b >> 4);
+        col_sh[x] = (unsigned char)(32 - bpp - (b & 15));
+        col_w1[x] = (unsigned short)(b1 >> 4);
+        col_sh1[x] = (unsigned char)(32 - bpp - (b1 & 15));
     }
     for (y = 0; y < H; y++) {
         unsigned g_left = 0;
-        unsigned r = focus ? 520 + 2 * st * y : (y * 1440 / H) & ~1u;
+        const unsigned r = focus ? r0 + 2 * st * y : (y * raw_h / H) & ~1u, sy = oy + st * y;
         const unsigned short *p0 = (const unsigned short *)(frame + r * lb);         // v183b: not volatile (cached frame)
         const unsigned short *p1 = (const unsigned short *)(frame + (r + 1) * lb);
-        unsigned *o = PV_RGBA + (20 + st * y) * PV_BW + PV_M1_X;
-        if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }   // v184b: bit depth chosen per row, never per pixel
+        unsigned *o = PV_RGBA + sy * PV_BW + ox;
+        if (sy >= ylim) break;
+        rows++;
+        if (b14) { M1_ROW(14, 0x3fffu, 4, 16320u) }       // v186b
+        else if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }    // v184b: bit depth chosen per row, never per pixel
         else if (st == 1) {
-            /* v184c: 10-bit full-res rows, split fast / peak so neither carries the other's state (v184b: 5-7
-             * spills / px). lb = 2400 -> row r + 1 = p0 + 1200 halfwords (one base register); clip = any sample
-             * >= 1020 <=> bit 10 of (s + 4); n += ceil(W / 4) per row, minus the zebra-replaced x % 4 == 0 pixels. */
+            /* v184c: 10-bit full-res rows, split fast / peak; v186b: row r + 1 = q + lb_hw halfwords (any width).
+             * clip = any sample >= 1020 <=> bit 10 of (s + 4); n += ceil(W / 4) per row, minus zebra x % 4 == 0. */
             const unsigned zp = y + fidx;
             n += (W + 3) >> 2;
             if (!do_peak) {
                 for (x = 0; x < W; x++) {
                     const unsigned short *q = p0 + col_w[x];
                     const unsigned sh = col_sh[x];
-                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[1200] << 16) | q[1201];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[lb_hw] << 16) | q[lb_hw + 1];
                     const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
                     const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
                     const unsigned g = (s1 + s2) >> 1;
@@ -4029,7 +4089,7 @@ static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
                 for (x = 0; x < W; x++) {
                     const unsigned short *q = p0 + col_w[x];
                     const unsigned sh = col_sh[x];
-                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[1200] << 16) | q[1201];
+                    const unsigned v0 = ((unsigned)q[0] << 16) | q[1], v1 = ((unsigned)q[lb_hw] << 16) | q[lb_hw + 1];
                     const unsigned s0 = (v0 >> sh) & 0x3ffu, s1 = (v0 >> (sh - 10)) & 0x3ffu;
                     const unsigned s2 = (v1 >> sh) & 0x3ffu, s3 = (v1 >> (sh - 10)) & 0x3ffu;
                     const unsigned g = (s1 + s2) >> 1, gp = pk_prev[x], gl = g_left;
@@ -4051,34 +4111,41 @@ static PV_HOT void pv_render_m1(const char *frame, unsigned bpp, int half_res)
             }
         }
         else { M1_ROW(10, 0x3ffu, 0, 1020u) }
-        if (st == 2) { memcpy(o, row_px, PV_M1_W * 4); memcpy(o + PV_BW, row_px, PV_M1_W * 4); }   // v183d: burst writes
-        else memcpy(o, row_px, W * 4);
+        memcpy(o, row_px, W * st * 4);                                           // v183d: burst writes
+        if (st == 2 && sy + 1 < ylim) memcpy(o + PV_BW, row_px, W * st * 4);
     }
-#undef M1_ROW
-    pv_clip_pct = clip ? ((clip * 100 + W * H - 1) / (W * H)) : 0;
+    pv_clip_pct = (clip && rows) ? ((clip * 100 + W * rows - 1) / (W * rows)) : 0;
     pv_stat[0]++; pv_stat[1] = black;
     if (n) { unsigned cur = sum / n; pv_stat[2] = pv_stat[0] > 1 ? (pv_stat[2] * 3 + cur) >> 2 : cur; }   // v183b: EMA
     // v184a: no pv_make_lut() here (fixed REC view)
 }
+#undef M1_ROW
 #define FN_DFLUSH   0xfc1267af   // v183b: dcache_flush_range(addr, len) = DCIMVAC loop + dsb sy (ROM 1.10d)
-/* v184a: flush only the row pairs (r, r + 1) pv_render_m1 samples for (mode, half_res), 32-byte aligned. */
-static void pv_dflush_m1(unsigned phys, unsigned lb, unsigned mode, int half_res)
+/* v184a / v186b: flush only the row pairs (r, r + 1) pv_render_m1 samples for (mode, half_res, raw_w, raw_h), 32-byte aligned. */
+static void pv_dflush_m1(unsigned phys, unsigned lb, unsigned mode, int half_res, unsigned raw_w, unsigned raw_h)
 {
-    const unsigned st = half_res ? 2 : 1, H = PV_M1_H / st, bpp = lb / 240;
-    unsigned y;
-    if (mode == 2 || !bpp) return;
-    if (mode == 1) {   // 1:1: cols 692 .. 1227 of rows 520 .. 919
-        unsigned x0 = (692 * bpp / 8) & ~31u, x1 = (1228 * bpp / 8 + 4 + 31) & ~31u;
+    unsigned bpp, st, y, ox, oy, ow, oh;
+    if (mode == 2 || !raw_w || !raw_h) return;
+    bpp = lb * 8 / raw_w;
+    if (!bpp) return;
+    st = half_res ? 2 : 1;
+    if (mode == 1 && raw_w >= 2 * PV_BW && raw_h >= 400) {   // 1:1: centre 720 x 400 photosites
+        const unsigned c0 = ((raw_w - 2 * PV_BW) / 2) & ~1u, r0 = ((raw_h - 400) / 2) & ~1u, H = 200 / st;
+        const unsigned x0 = (c0 * bpp / 8) & ~31u;
+        unsigned x1 = ((c0 + 2 * PV_BW + 2) * bpp / 8 + 4 + 31) & ~31u;
         if (x1 > lb) x1 = lb;
         for (y = 0; y < H; y++) {
-            unsigned a = phys + (520 + 2 * st * y) * lb, s;
+            unsigned a = phys + (r0 + 2 * st * y) * lb, s;
             s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
             a += lb;
             s = (a + x0) & ~31u; ((fn2)FN_DFLUSH)(s, ((a + x1 + 31) & ~31u) - s);
         }
-    } else {           // 4:3: whole row pairs
+    } else {           // whole frame: whole row pairs
+        unsigned H;
+        pv_m1_rect(raw_w, raw_h, &ox, &oy, &ow, &oh);
+        H = oh / st;
         for (y = 0; y < H; y++) {
-            unsigned r = (y * 1440 / H) & ~1u, s = (phys + r * lb) & ~31u, e = (phys + (r + 2) * lb + 31) & ~31u;
+            unsigned r = (y * raw_h / H) & ~1u, s = (phys + r * lb) & ~31u, e = (phys + (r + 2) * lb + 31) & ~31u;
             ((fn2)FN_DFLUSH)(s, e - s);
         }
     }
@@ -4101,30 +4168,34 @@ static void pv_mask_opaque_wide(int full, unsigned raw_h)
 static PV_HOT void pv_render_m1_wide(const char *frame, unsigned bpp, int half_res, unsigned raw_w, unsigned raw_h)
 {
     const unsigned mode = pv_mode, zebra = pv_zebra, peak = pv_peak, fidx = pv_stat[0];   // hoisted (volatile globals)
-    const unsigned black = 127, focus = (mode == 1), st = half_res ? 2 : 1;
+    const unsigned black = 127, focus = (mode == 1), st = half_res ? 2 : 1, ylim = pv_m1_ylim();
     const unsigned out_w = PV_BW, out_h = focus ? 200 : (raw_h > 1440 ? 124 : 100), out_y = focus ? 20 : (20 + (200 - out_h) / 2);
-    const unsigned W = out_w / st, H = out_h / st, lb = raw_w * bpp / 8, lb_hw = lb >> 1;
-    const int do_peak = peak && !half_res, b12 = (bpp == 12);
+    const unsigned W = out_w / st, lb = raw_w * bpp / 8, lb_hw = lb >> 1;
+    const int do_peak = peak && !half_res, b12 = (bpp == 12), b14 = (bpp == 14);
     const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;
     const unsigned w239 = out_h * 239 / 100, tx0 = (PV_BW - w239) / 2, tx1 = PV_BW - 1 - tx0;   // 2.39:1 framing ticks
-    unsigned x, y, c0, r0, sum = 0, n = 0, clip = 0;
-    static unsigned short pk_prev[PV_BW], col_w[PV_BW];
-    static unsigned char col_sh[PV_BW];
+    unsigned x, y, c0, r0, sum = 0, n = 0, clip = 0, H = out_h / st;
+    static unsigned short pk_prev[PV_BW], col_w[PV_BW], col_w1[PV_BW];
+    static unsigned char col_sh[PV_BW], col_sh1[PV_BW];   // v186b: second sample of the quad (14b pairs span 3 halfwords)
     static unsigned row_px[PV_BW];   // cached row, burst-copied to uncached PV_RGBA (never reentrant)
     if (!pv_ok() || mode == 2 || !raw_w || !raw_h) return;
+    if (bpp != 10 && bpp != 12 && bpp != 14) return;
     if (!pv_m1_lut_ok) pv_build_m1_luts();
     c0 = raw_w > 240 ? ((raw_w - 240) / 2) & ~1u : 0;
     r0 = raw_h > 400 ? ((raw_h - 400) / 2) & ~1u : 0;
     for (x = 0; x < W; x++) {
-        unsigned c = focus ? ((c0 + x * 240 / W) & ~1u) : ((x * raw_w / W) & ~1u), b = c * bpp;
+        unsigned c = focus ? ((c0 + x * 240 / W) & ~1u) : ((x * raw_w / W) & ~1u), b = c * bpp, b1 = b + bpp;
         col_w[x] = (unsigned short)(b >> 4);
-        col_sh[x] = (unsigned char)((b12 ? 20 : 22) - (b & 15));
+        col_sh[x] = (unsigned char)(32 - bpp - (b & 15));
+        col_w1[x] = (unsigned short)(b1 >> 4);
+        col_sh1[x] = (unsigned char)(32 - bpp - (b1 & 15));
     }
 #define M1W_ROW(D, M, SC, THR) \
     for (x = 0; x < W; x++) { \
-        const unsigned w = col_w[x], sh = col_sh[x]; \
+        const unsigned w = col_w[x], sh = col_sh[x], w1 = col_w1[x], sh1 = col_sh1[x]; \
         const unsigned v0 = ((unsigned)p0[w] << 16) | p0[w + 1], v1 = ((unsigned)p1[w] << 16) | p1[w + 1]; \
-        unsigned s0 = (v0 >> sh) & (M), s1 = (v0 >> (sh - (D))) & (M), s2 = (v1 >> sh) & (M), s3 = (v1 >> (sh - (D))) & (M); \
+        const unsigned u0 = ((unsigned)p0[w1] << 16) | p0[w1 + 1], u1 = ((unsigned)p1[w1] << 16) | p1[w1 + 1]; \
+        unsigned s0 = (v0 >> sh) & (M), s1 = (u0 >> sh1) & (M), s2 = (v1 >> sh) & (M), s3 = (u1 >> sh1) & (M); \
         unsigned mx = s0 > s1 ? s0 : s1, m2 = s2 > s3 ? s2 : s3, px, g; \
         mx = mx > m2 ? mx : m2; \
         s0 >>= (SC); s1 >>= (SC); s2 >>= (SC); s3 >>= (SC); \
@@ -4143,6 +4214,7 @@ static PV_HOT void pv_render_m1_wide(const char *frame, unsigned bpp, int half_r
         if (do_peak) { pk_prev[x] = (unsigned short)g; g_left = g; } \
         if (st == 2) { row_px[2 * x] = px; row_px[2 * x + 1] = px; } \
         else row_px[x] = px; \
+        (void)(D); \
     }
     for (y = 0; y < H; y++) {
         unsigned g_left = 0;
@@ -4150,7 +4222,9 @@ static PV_HOT void pv_render_m1_wide(const char *frame, unsigned bpp, int half_r
         const unsigned short *p0 = (const unsigned short *)(frame + r * lb);
         const unsigned short *p1 = (const unsigned short *)(frame + (r + 1) * lb);
         unsigned *o = PV_RGBA + (out_y + st * y) * PV_BW;
-        if (b12) { M1W_ROW(12, 0xfffu, 2, 4080u) }
+        if (out_y + st * y >= ylim) { H = y; break; }   // v186b: BIT selector bar rows
+        if (b14) { M1W_ROW(14, 0x3fffu, 4, 16320u) }   // v186b
+        else if (b12) { M1W_ROW(12, 0xfffu, 2, 4080u) }
         else if (st == 1) {   // 10-bit full-res rows: row r + 1 = q + lb_hw halfwords
             const unsigned zp = y + fidx;
             n += (W + 3) >> 2;
@@ -4197,10 +4271,10 @@ static PV_HOT void pv_render_m1_wide(const char *frame, unsigned bpp, int half_r
         else { M1W_ROW(10, 0x3ffu, 0, 1020u) }
         if (!focus && (st * y < 6 || st * y + st > out_h - 6)) { row_px[tx0] = 0xFF888888u; row_px[tx1] = 0xFF888888u; }
         memcpy(o, row_px, W * st * 4);
-        if (st == 2) memcpy(o + PV_BW, row_px, W * st * 4);
+        if (st == 2 && out_y + st * y + 1 < ylim) memcpy(o + PV_BW, row_px, W * st * 4);
     }
 #undef M1W_ROW
-    pv_clip_pct = clip ? ((clip * 100 + W * H - 1) / (W * H)) : 0;
+    pv_clip_pct = (clip && H) ? ((clip * 100 + W * H - 1) / (W * H)) : 0;
     pv_stat[0]++; pv_stat[1] = black;
     if (n) { unsigned cur = sum / n; pv_stat[2] = pv_stat[0] > 1 ? (pv_stat[2] * 3 + cur) >> 2 : cur; }
 }
@@ -4232,9 +4306,9 @@ static void pv_dflush_m1_wide(unsigned phys, unsigned lb, unsigned mode, int hal
     }
 }
 /* v185: ImgMode 1 preview dispatch (Wide 1:3 vs 1920 x 1440 4:3) */
-static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full); }
-static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr); }
-static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr); }
+static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full, sh_m1_w(), sh_m1_h()); }
+static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); }
+static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr, sh_m1_w(), sh_m1_h()); }
 /* v182 (B.5) / v184a: preview during an ImgMode 1 take, task M10Pv (prio 0x1E, below M10XR 0x1C / M10Key 0x1D: idle CPU only).
  * v184a: renders the newest CAPTURED frame k = xr_prod - 1 (cached view + sampled-row dflush) under a seqlock on
  * xr_prod (the slot of k is rewritten by the capture of frame k + lj_raw_n); half res when the encoder lags >= 2.
@@ -4355,7 +4429,7 @@ static void pv_stby_task(void)
             /* v185b: sentinel = top-right corner of the opaque mask (21, 358), never touched by the yellow clip % text
              * at (2, 22) (the old (30, 2) sentinel looped mask + HUD + refresh as soon as a highlight clipped); Wide
              * focus view has no mask (image fills 360 x 200): watch the opaque top HUD bar (1, 358) instead. */
-            int wiped = (sh_m1_wide() && pv_mode == 1) ? PV_RGBA[1 * PV_BW + 358] != PV_BLACK : PV_RGBA[21 * PV_BW + 358] != PV_BLACK;
+            int wiped = PV_RGBA[1 * PV_BW + 358] != PV_BLACK;   // v186b: opaque top HUD bar sentinel for ALL ImgMode 1 modes
             int masked = 0;
             if (pv_mask_dirty || wiped) { pv_mask_dirty = 0; pv_m1_mask(0); masked = 1; pv_hud_dirty = 1; }   // overlay erased / view changed
             if (pv_hud_dirty) { pv_hud_dirty = 0; if (sh_m1_wide() && !masked) pv_m1_mask(0); sh_pv_hud(); }   // v185b: one mask per pass
@@ -4567,12 +4641,16 @@ static void lv_x3(void)
     }
     if (sh_on && sh_prof()->kind == SH_M1) {   // v182: ImgMode 1 1440p: the capture is already 1920 wide (no encoder crop)
         const sh_prof_t *pr = sh_prof();
-        lines = pr->h;                                 // v185: profile frame height (1440 / 1800)
-        if (pr->h > 1440) x_lo = 37600;                // v185b: Standby + REC arm inside V-blank (Wide 1800 readout ends at 37018 us)
+        unsigned ro_end = ((32u + pr->h + 16u) * (pr->lclk + 1u) + 31u) / 32u;   // v186b: readout end (us after CMOS 0)
+        lines = pr->h;                                 // v185: profile frame height
+        if (pr->per > 37000) x_lo = (ro_end + 600 > 35166u) ? ro_end + 600 : 35166u;   // v186b: arm inside V-blank (24p)
+        else x_lo = (ro_end + 400 > pr->per - 4500u) ? ro_end + 400 : pr->per - 4500u;   // v186b: 30p
+        x_hi = pr->per - 1200u;
+        if (x_lo > x_hi - 400u) x_lo = x_hi - 400u;
         if (!sh_pv) {
-            bpp = pr->bpp; x_rsel = 0x10; x_he_fix = 1; lj_eoff = 0; enc_wov = 0;
+            bpp = sh_bpp; x_rsel = 0x10; x_he_fix = 1; lj_eoff = 0; enc_wov = 0;   // v186b: depth from the BIT selector
             x_need = pr->h - 4; lj_eh = pr->h;
-            lj_kwait = (pr->bpp == 12) ? 300 : 8000;
+            lj_kwait = 8000;
         }
         else { bpp = 10; x_rsel = 0x10; x_he_fix = 0; x_need = pr->h - 4; }   // v185b: Standby waits for the full head too
     } else if (sh_on) {
@@ -4628,7 +4706,8 @@ static void lv_x3(void)
     {   // v170: allow 2-block CH12 (> 4 MiB) when cropping 14-bit into a < 4 MiB encoder window
         unsigned enc_fb_est = (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * bpp / 8;
         if (lines * lvn_lb > 0x00400000) {
-            if (!(x_zoom && bpp == 14 && (x_enc == 11 || x_enc == 14) && enc_wov && enc_fb_est <= 0x00400000 && (lines - lines / 2) * lvn_lb <= 0x00400000))
+            if (!(x_zoom && bpp == 14 && (x_enc == 11 || x_enc == 14) && enc_wov && enc_fb_est <= 0x00400000 && (lines - lines / 2) * lvn_lb <= 0x00400000) &&
+                !(x_m1 && (x_enc == 11 || (sh_on && sh_pv)) && (lines - lines / 2) * lvn_lb <= 0x00400000))   // v186a/v186b: ImgMode 1 REC + Standby, 2-block CH12 up to 8 MiB
                 lines = 0x00400000 / lvn_lb;   // one EDMAC block < 4 MiB
         }
     }
@@ -4769,6 +4848,7 @@ static void lv_x3(void)
     }
     if (fl & 0x100) {                               // v37: record to card
         unsigned drops = 0, fr = 0, t0, maxbl = 0, xr_slot_cnt = 0, xr_t0_ms = 0;   // v183: 24.00p slots, REC t0
+        int turbo_held = 0;   // v186a: FN_LCLK_HOLD0 + FN_CLKSAVE_TAKE held
         if (npass > XR_MAX) npass = XR_MAX;
         xr_fb = lines * lvn_lb;
         xr_mlv = (fl & 0x1000000) ? 1 : 0;          // v55: MLV output
@@ -4776,11 +4856,15 @@ static void lv_x3(void)
         xr_stride = 512 + xr_fb + xr_nullsz;
         xr_nslot = (x_exsz - 0x00080000) / (xr_mlv ? xr_stride : xr_fb);
         lj_on = (x_enc == 11 && xr_mlv && (lvn_bpp == 10 || ((lvn_bpp == 14 || lvn_bpp == 12) && (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * lvn_bpp / 8 <= 0x00400000))) ? 1 : 0;   // v101/v170: compressed REC (10b or <4 MiB cropped 14b); v177: 12b too
+        if (!lj_on && x_m1 && x_enc == 11 && xr_mlv && (lvn_bpp == 10 || lvn_bpp == 12 || lvn_bpp == 14) && (lines - lines / 2) * lvn_lb <= 0x00400000) lj_on = 1;   // v186a: ImgMode 1 2-block CH12 (> 4 MiB) compressed REC
         if (lj_on) {    // raw ring 3 x xr_fb, compressed ring after it, last 512 KiB = SIO copy
             unsigned enc_fb = (enc_wov ? enc_wov : x_w) * (lj_eh ? lj_eh : lines) * lvn_bpp / 8;
             lj_raw_n = 3; lj_cbase = (lj_raw_n * xr_fb + 0xfff) & ~0xfffu;
-            lj_cslot_sz = (x_zoom || x_m1 || lvn_bpp == 12) ? ((enc_fb + enc_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000;   /* v177/v180: slots sized by frame */ lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
-            if (x_m1) {   // v181 (r159): raw ring 5 absorbs encoder jitter (12b mean 41.5 < 41.67 ms); compressed slots end before WR2 (x_exsz - 0xC0000)
+            lj_cslot_sz = (x_zoom || x_m1 || lvn_bpp == 12) ? ((enc_fb + enc_fb / 8 + 0xffff) & ~0xffffu) : 0x00280000;   /* v177/v180: slots sized by frame */
+            if (x_m1 && lvn_bpp == 14 && enc_fb > 0x00400000) lj_cslot_sz = (enc_fb * 4 / 5 + 0xffff) & ~0xffffu;   // v186a: 5.5 MB 14b frame -> 6-7 slots in 48 MiB (LJ92 ~ 0.6x raw)
+            lj_cslot_n = (x_exsz - 0x00080000 - lj_cbase) / lj_cslot_sz;
+            if (x_m1 && xr_fb > 0x00400000) lj_cslot_n = (x_exsz - 0x000C0000 - lj_cbase) / lj_cslot_sz;   // v186b: > 4 MiB frames keep raw ring 3 (48 MiB -> 7-8 compressed slots)
+            else if (x_m1) {   // v181 (r159): raw ring 5 absorbs encoder jitter (12b mean 41.5 < 41.67 ms); compressed slots end before WR2 (x_exsz - 0xC0000)
                 unsigned cb5 = (5 * xr_fb + 0xfff) & ~0xfffu, n5 = (x_exsz - 0x000C0000 - cb5) / lj_cslot_sz;
                 if (n5 >= 4) { lj_raw_n = 5; lj_cbase = cb5; lj_cslot_n = n5; }
                 else lj_cslot_n = (x_exsz - 0x000C0000 - lj_cbase) / lj_cslot_sz;
@@ -4837,6 +4921,10 @@ static void lv_x3(void)
         ts_start(buf + x_exsz);   // v153: after worker creation / before first readout
         slog_len = 0; slog_lost = 0; slog_defer = 1;   // v155: no card log I/O from the capture loop
         xr_last_drop_ms = 0;   // v183
+        if (lj_on) {   // v186a: Canon refcounted clock holds for the whole compressed take (released after lj/xr drain)
+            FW0(FN_LCLK_HOLD0); FW0(FN_CLKSAVE_TAKE); turbo_held = 1;
+            slog("v186a turbo=%d", turbo_held, 0);
+        }
         if (x_m1 && lj_on) {   // v183: 2 pre-roll captures (not published, encoder not kicked) before t0
             x_early = 0;
             for (i = 0; i < 2 && !(sh_on && sh_stop_req); i++) { unsigned dt0 = 0, ep0 = 0; lvn_cap(buf, phys, lines, &dt0, &ep0); }
@@ -5012,6 +5100,7 @@ static void lv_x3(void)
         if (lj_on && x_kick) { unsigned t = get_tick_count(); while (lj_kicked && !cb_done && get_tick_count() - t < 3000) msleep(5); lj_collect(); }   // v127: fallback if lj_drain skipped on err
         if (lj_on) { GiveSemaphore(lj_sem); { unsigned t = get_tick_count(); while (!lj_done && get_tick_count() - t < 20000) { GiveSemaphore(lj_sem); msleep(20); } } }
         { unsigned t = get_tick_count(); while (!xr_done && get_tick_count() - t < 20000) { GiveSemaphore(xr_sem); msleep(20); } }
+        if (turbo_held) { FW0(FN_CLKSAVE_REL); FW0(FN_LCLK_REL0); turbo_held = 0; slog("v186a turbo released", 0, 0); }   // v186a: every exit path (incl. drain timeout)
         if (!xr_done || (lj_on && (!lj_done || lj_kicked))) {
             // A timed-out task/encoder may still touch EXMEM. Keep all state,
             // semaphores and module resident; only a power cycle can recover.
@@ -5443,11 +5532,11 @@ static void sh_expo_apply(void)
         if (sh_prof()->m1_wide) {   // v185: wide ImgMode 1 window (CMOS 2 / 5 / 7)
             sh_hook_w(0x240 + 4 * 2, 0x10000 | 0x742);
             sh_hook_w(0x240 + 4 * 5, 0x10000 | 0x020);
-            sh_hook_w(0x240 + 4 * 7, 0x10000 | (sh_m1_h() > 1440 ? 0xac6 : 0xae9));
+            sh_hook_w(0x240 + 4 * 7, 0x10000 | (sh_prof()->c7 ? sh_prof()->c7 : 0xac6u));   // v186b: per-profile CMOS[7]
         } else {
             sh_hook_w(0x240 + 4 * 2, 0);
             sh_hook_w(0x240 + 4 * 5, 0x10000 | 0x300);
-            sh_hook_w(0x240 + 4 * 7, 0x10000 | 0xae9);
+            sh_hook_w(0x240 + 4 * 7, 0x10000 | (sh_prof()->c7 ? sh_prof()->c7 : 0xae9u));   // v186b: per-profile CMOS[7]
         }
         sh_hook_w(0x240, 0x10000 | sh_iso_c[sh_m1_iso()]);
         sh_hook_w(0x200 + 20, 1);
@@ -5493,8 +5582,8 @@ static void sh_expo_off(void)
 // Pad: UP/DOWN pick the field, LEFT/RIGHT change it. REC/SET = take. MENU+SET = quit.
 // Fields: 0 ISO, 1 Tv, 2 aperture, 3 profile, 4 zebras, 5 preview size.
 // ---------------------------------------------------------------------------
-#define SH_NFIELD 6
-static volatile unsigned sh_field = 0, sh_hud_drawn = 0;
+#define SH_NFIELD 7   // v186b: 0 ISO, 1 Tv, 2 Av, 3 SIZE, 4 BIT, 5 ZEB/PK, 6 VIEW
+static volatile unsigned sh_hud_drawn = 0;   // v186b: sh_field moved up (pv_m1_ylim)
 static unsigned sh_toast_t = 0, sh_rec_t0 = 0;
 // v182 (B.3): in ImgMode 1 every HUD background is OPAQUE black (the 50 % grey let Canon's colour bars through)
 static unsigned sh_bg(void) { return sh_is_m1() ? COLOR_BLACK : COLOR_GREY_DK_TRANS; }
@@ -5535,9 +5624,13 @@ static void sh_hud(int force)
         sprintf(s, "%02u:%02u", sec / 60, sec % 60);
         draw_string(18, 2, s, MAKE_COLOR(bg, COLOR_RED));
     } else draw_string(4, 2, "M10", SH_C_DIM);
-    sprintf(s, "%s%s", pr->tag, pr->kind == SH_X3 ? (sh_x3_ok ? "" : "*") : pr->kind == SH_M1 ? (sh_m1_ok ? "" : "*") : (pr->fps != sh_armed_fps ? "*" : ""));
+    if (pr->kind == SH_M1) sprintf(s, "%s %ub%s", pr->tag, sh_bpp, sh_m1_ok ? "" : "*");   // v186b: SIZE + BIT
+    else sprintf(s, "%s%s", pr->tag, pr->kind == SH_X3 ? (sh_x3_ok ? "" : "*") : (pr->fps != sh_armed_fps ? "*" : ""));
     draw_string(180 - (int)strlen(s) * 4, 2, s, SH_C_BAR);
-    mbps = pr->kind == SH_M1 ? (pr->bpp == 12 ? 68 : 60) : pr->bpp == 14 ? 56 : pr->bpp == 12 ? 54 : 45;   // measured MB/s (LJ92, typical scene; 1440p: 2.5 / 2.8 MiB x 24)
+    if (pr->kind == SH_M1) {   // v186b: W * H * fps * LJ92 factor (bytes / px x 100: 14b 1.02, 12b 1.08, 10b 0.95) -> MB/s
+        mbps = ((unsigned)pr->w * pr->h * pr->fps / 100u) * (sh_bpp == 14 ? 102u : sh_bpp == 12 ? 108u : 95u) / 1000000u;   // 32-bit (no __aeabi_uldivmod)
+        if (!mbps) mbps = 1;
+    } else mbps = pr->bpp == 14 ? 56 : pr->bpp == 12 ? 54 : 45;   // measured MB/s (LJ92, typical scene)
     mins = (kb >> 10) / mbps / 60;
     sprintf(s, "%umin", mins);
     draw_string(300 - (int)strlen(s) * 8, 2, s, mins < 3 ? MAKE_COLOR(bg, COLOR_RED) : SH_C_BAR);
@@ -5549,18 +5642,28 @@ static void sh_hud(int force)
     // bottom bar: hidden during a take (nothing to change)
     draw_rectangle(0, 220, 359, 239, MAKE_COLOR(bg, bg), RECT_BORDER0 | DRAW_FILLED);
     if (!sh_rec_on) {
-        static const int fx[SH_NFIELD] = { 4, 80, 140, 200, 262, 312 };
+        static const int fx[SH_NFIELD] = { 4, 68, 114, 166, 236, 272, 312 };   // v186b
         unsigned f;
         for (f = 0; f < SH_NFIELD; f++) {
             switch (f) {
             case 0: if (m1) sprintf(s, "ISO %u", sh_iso_v[sh_m1_iso()]); else if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO"); break;
             case 1: sh_fmt_tv(tv, m1 ? sh_m1_tv() : sh_tv_i); strcpy(s, tv); break;
             case 2: sh_fmt_av(s); break;
-            case 3: if (pr->kind == SH_X3) sprintf(s, "1x3/%ub", pr->bpp); else if (m1) sprintf(s, "1440/%ub", pr->bpp); else sprintf(s, "%u/%ub", pr->fps, pr->bpp); break;
-            case 4: strcpy(s, pv_zebra ? (pv_peak ? "Z+P" : "ZEB") : (pv_peak ? "PK" : "---")); break;   // v183
-            default: if (m1) strcpy(s, pv_mode == 0 ? (sh_m1_wide() ? "WIDE" : "4:3") : pv_mode == 1 ? "1:1" : "OFF"); else strcpy(s, pv_full ? "PLEIN" : "VIGN"); break;
+            case 3: strcpy(s, pr->short_tag ? pr->short_tag : pr->tag); break;          // v186b: SIZE
+            case 4: sprintf(s, "%ub", sh_bpp); break;                                   // v186b: BIT
+            case 5: strcpy(s, pv_zebra ? (pv_peak ? "Z+P" : "ZEB") : (pv_peak ? "PK" : "---")); break;   // v183
+            default: if (m1) strcpy(s, pv_mode == 0 ? (sh_m1_wide() ? "WIDE" : "FIT") : pv_mode == 1 ? "1:1" : "OFF"); else strcpy(s, pv_full ? "PLEIN" : "VIGN"); break;
             }
             draw_string(fx[f], 222, s, f == sh_field ? SH_C_SEL : SH_C_BAR);
+        }
+        if (sh_field == 4) {   // v186b: Magic Lantern-style depth selector bar, opaque, rows 200..219
+            static const unsigned bv[3] = { 14, 12, 10 };
+            unsigned i;
+            draw_rectangle(0, 200, 359, 219, MAKE_COLOR(COLOR_BLACK, COLOR_GREY), RECT_BORDER1 | DRAW_FILLED);
+            for (i = 0; i < 3; i++) {
+                sprintf(s, "%ub", bv[i]);
+                draw_string(124 + 40 * (int)i, 202, s, bv[i] == sh_bpp ? SH_C_SEL : sh_bpp_ok(pr, bv[i]) ? SH_C_BAR : MAKE_COLOR(COLOR_BLACK, COLOR_GREY_DK));
+            }
         }
     } else {
         if (m1) sprintf(s, "ISO %u", sh_iso_v[sh_m1_iso()]); else if (sh_iso_i) sprintf(s, "ISO %u", sh_iso_v[sh_iso_i]); else strcpy(s, "ISO AUTO");
@@ -5690,8 +5793,12 @@ static int sh_handle_nav(int zoom)   // v174: UP/DOWN = field, LEFT/RIGHT = valu
     if (edge) t_rep = get_tick_count();
     prev = cur;
     if (!edge) return 0;
-    if (edge & 4) { sh_field = (sh_field + SH_NFIELD - 1) % SH_NFIELD; return 1; }
-    if (edge & 8) { sh_field = (sh_field + 1) % SH_NFIELD; return 1; }
+    if (edge & 12) {   // v186b: leaving BIT wipes its selector bar (rows 200..219)
+        unsigned of = sh_field;
+        sh_field = (edge & 4) ? (sh_field + SH_NFIELD - 1) % SH_NFIELD : (sh_field + 1) % SH_NFIELD;
+        if (of == 4 && sh_field != 4) { pv_mask_dirty = 1; return 2; }
+        return 1;
+    }
     d = (edge & 2) ? 1 : -1;
     if (sh_is_m1() && (sh_field == 0 || sh_field == 1)) {   // v182: ImgMode 1: no AUTO (no Canon AE on that path), wrap 1..N-1
         unsigned n = sh_field ? SH_NTV : SH_NISO, i = sh_field ? sh_m1_tv() : sh_m1_iso();
@@ -5714,16 +5821,22 @@ static int sh_handle_nav(int zoom)   // v174: UP/DOWN = field, LEFT/RIGHT = valu
     }
     case 3: {
         unsigned k0 = sh_prof()->kind;
+        unsigned g0 = sh_m1_geom(sh_prof());
         sh_prof_idx = (sh_prof_idx + SH_NPROF + d) % SH_NPROF;
+        sh_bpp_clamp(sh_prof());                          // v186b: SIZE clamps BIT to the highest supported depth
         if (sh_prof()->kind != SH_X3 && k0 == SH_X3) { sh_x3_ok = 0; sh_hook_w(0x240 + 4 * 7, 0); }   // v178: leaving 1x3 drops its CMOS 7 override
         if ((k0 == SH_M1) != (sh_prof()->kind == SH_M1)) { ret = 2; break; }   // v182: into / out of ImgMode 1: shell_task switches (Lua IPC, tables)
         sh_arm_fps(sh_prof(), !zoom);
         sh_expo_apply();                                  // Tv lines depend on the frame length
+        if (sh_m1_geom(sh_prof()) != g0) ret = 2;         // v186b: new SIZE -> preview geometry (re-arm in the shell)
         if (zoom && sh_prof()->kind == SH_X5 && sh_prof()->fps != sh_armed_fps) sh_say("CADENCE: SORTIR/RENTRER x5", 0);
         if (sh_prof()->kind == SH_X3) sh_say("1x3 25p 12b", "REC = armer");
         break;
     }
-    case 4: {   // v183: Z+P -> PK -> ZEB -> --- (m = zebra | peak << 1, idx = 3 - m)
+    case 4:     // v186b: BIT 14 -> 12 -> 10 (RIGHT) / 10 -> 12 -> 14 (LEFT); no sensor re-switch (sh_m1_geom unchanged)
+        sh_bpp_step(sh_prof(), d);
+        break;
+    case 5: {   // v183: Z+P -> PK -> ZEB -> --- (m = zebra | peak << 1, idx = 3 - m)
         unsigned m = (pv_zebra ? 1u : 0u) | (pv_peak ? 2u : 0u), idx = 3u - m;
         idx = (idx + 4u + (unsigned)d) & 3u; m = 3u - idx;
         pv_zebra = m & 1u; pv_peak = (m >> 1) & 1u;

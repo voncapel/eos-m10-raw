@@ -33,7 +33,13 @@ class TestGeometry(unittest.TestCase):
             self.assertFalse(E.is_m1(img) or E.is_wide(img))
 
     def test_imgmode1_no_ob(self):
-        for h, w, wide in ((1440, 1920, False), (1800, 1728, True), (1440, 1728, True)):
+        cases = (
+            (1440, 1920, False), (1536, 2048, False), (1440, 2160, False),
+            (1296, 2304, False), (1088, 2592, False), (1080, 1920, False),
+            (1536, 2304, False), (1440, 2592, False),
+            (1800, 1728, True), (1440, 1728, True), (1296, 1728, True),
+        )
+        for h, w, wide in cases:
             img = np.arange(h * w, dtype=np.uint32).reshape(h, w).astype(np.uint16)
             a = E.active(img)
             self.assertEqual(a.shape, (h, w))

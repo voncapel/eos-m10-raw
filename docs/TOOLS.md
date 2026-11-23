@@ -42,7 +42,9 @@ cc -std=c11 -Wall -Wextra -Werror tools/test_m10tasktrace_device.c -o /tmp/t && 
 
 | Test suite | What it verifies |
 |---|---|
-| `test_m10_v185.py` | Wide `1:3` profiles, CMOS `2/5/7` (never `CMOS[3]`), `[0xfc3c]` IPC (`+0x280`), 144 ASan+UBSan Wide preview/dflush runs, `v185b` Standby `x_lo`/sentinel/`WBInteg` contracts |
+| `test_m10_v186.py` | **v186 ML Size × Bit-Depth selector**, `LCLK_HOLD0`+`ClockSave` turbo holds, `lj_raw_n=3` `>4 MiB` EXMEM ring, and ASan+UBSan compiled C preview/dflush across all **10 profiles × 26 bit-depth combos** (10/12/14-bit) |
+| `test_m10export.py` | `m10export.py` zero-OB detection for all `v186` `ImgMode 1` geometries, legacy ×5/Film OB strip, Wide `1:3` FPM, and CinemaDNG `DefaultScale` |
+| `test_m10_v185.py` | Wide `1:3` profiles, CMOS `2/5/7` (never `CMOS[3]`), `[0xfc3c]` IPC (`+0x280`), 144 ASan+UBSan Wide preview/dflush runs, Standby `x_lo`/sentinel/`WBInteg` contracts |
 | `test_m10_v184.py` | 576 bit-identical `1440p` preview combos (`v184b`/`v184c`), LUTs, async Standby/REC tasks, half-press toggle, stability guards |
 | `test_m10_v183.py` | Focus peaking, pre-roll, µs timestamps, `M10SHELL.LUA` IPC |
 | `test_m10_v182.py` | `ImgMode 1` RAM tables, opaque overlay mask, `M10WB` watchdog, `hostlua` IPC simulation |

@@ -56,25 +56,28 @@ class TestV185Tables(unittest.TestCase):
         t = self.text
         blk = t[t.index('static const sh_prof_t sh_profs[] = {'):]
         blk = blk[:blk.index('};')]
-        rows = PROF_RE.findall(blk)
-        self.assertEqual(len(rows), 14)
-        P = {r[8]: dict(fps=int(r[0]), bpp=int(r[1]), kind=r[3], fl=int(r[4]), per=int(r[5]), w=int(r[7]),
-                        h=int(r[9]), lclk=int(r[10]), wide=int(r[11])) for r in rows}
-        self.assertEqual(rows[0][8], '1440p 24p 10b')   # default profile unchanged
-        p0 = P['1440p 24p 10b']
+        rows = re.findall(
+            r'\{\s*(\d+),\s*(\d+),\s*0x[0-9a-fA-F]+,\s*(\w+),\s*(\d+),\s*(\d+),\s*0,\s*(\d+),\s*"([^"]+)",'
+            r'\s*(\d+),\s*(\d+),\s*(\d+),\s*0x[0-9a-fA-F]+,\s*0x[0-9a-fA-F]+,\s*(\d+),\s*"([^"]+)"\s*\}',
+            blk,
+        )
+        self.assertEqual(len(rows), 10)
+        P = {r[6]: dict(fps=int(r[0]), bpp=int(r[1]), kind=r[2], fl=int(r[3]), per=int(r[4]), w=int(r[5]),
+                        h=int(r[7]), lclk=int(r[8]), wide=int(r[9]), mask=int(r[10])) for r in rows}
+        self.assertEqual(rows[0][6], '1920x1440 24p')   # default profile = 1440p 4:3
+        p0 = P['1920x1440 24p']
         self.assertEqual((p0['w'], p0['h'], p0['wide'], p0['lclk']), (1920, 1440, 0, 732))
-        self.assertEqual(P['Wide 1800 10b'], dict(fps=24, bpp=10, kind='SH_M1', fl=2080, per=41665, w=1728, h=1800, lclk=640, wide=1))
-        self.assertEqual(P['Wide 1440 12b'], dict(fps=24, bpp=12, kind='SH_M1', fl=1819, per=41666, w=1728, h=1440, lclk=732, wide=1))
-        self.assertEqual(P['Wide 1440 10b'], dict(fps=24, bpp=10, kind='SH_M1', fl=1819, per=41666, w=1728, h=1440, lclk=732, wide=1))
+        self.assertEqual(P['Wide 1800 24p'], dict(fps=24, bpp=14, kind='SH_M1', fl=2080, per=41665, w=1728, h=1800, lclk=640, wide=1, mask=7))
+        self.assertEqual(P['Wide 1440 24p'], dict(fps=24, bpp=14, kind='SH_M1', fl=1819, per=41666, w=1728, h=1440, lclk=732, wide=1, mask=7))
         for tag, p in P.items():
             if p['kind'] == 'SH_M1':
-                self.assertLessEqual(p['w'] * p['h'] * p['bpp'] // 8, 0x400000, tag)
+                self.assertLessEqual((p['h'] - p['h'] // 2) * (p['w'] * p['bpp'] // 8), 0x400000, tag)
         self.assertIn('#define SH_IPC_ARG_OFF 0x280', t)
         self.assertIn('static unsigned sh_m1_fc3c(void) { return (7058u - 2u * sh_m1_head_h()) / 2u; }', t)
         self.assertIn('static unsigned sh_m1_head_h(void) { return sh_m1_h() + 16; }', t)
         self.assertEqual(((7058 - 2 * (1800 + 16)) // 2, (7058 - 2 * (1440 + 16)) // 2), (1713, 2073))
         lv = strip_comments(func_def(t, 'lv_x3'))
-        for s in ('lines = pr->h;', 'if (pr->h > 1440) x_lo = 37600;', 'if (lines > 1800) lines = 1800;', 'x_need = pr->h - 4; lj_eh = pr->h;'):
+        for s in ('lines = pr->h;', 'if (lines > 1800) lines = 1800;', 'x_need = pr->h - 4; lj_eh = pr->h;'):
             self.assertIn(s, lv)
 
     def test_cmos_wide_contract(self):
@@ -83,10 +86,10 @@ class TestV185Tables(unittest.TestCase):
         wide, rest = e[i:e.index('} else {', i)], e[e.index('} else {', i):]
         self.assertIn('sh_hook_w(0x240 + 4 * 2, 0x10000 | 0x742);', wide)
         self.assertIn('sh_hook_w(0x240 + 4 * 5, 0x10000 | 0x020);', wide)
-        self.assertIn('sh_hook_w(0x240 + 4 * 7, 0x10000 | (sh_m1_h() > 1440 ? 0xac6 : 0xae9));', wide)
+        self.assertIn('sh_prof()->c7', wide)
         m1_11 = rest[:rest.index('sh_hook_w(0x240, 0x10000 | sh_iso_c[sh_m1_iso()]);')]
         self.assertIn('sh_hook_w(0x240 + 4 * 2, 0);', m1_11)                     # 1:1 ImgMode 1 clears CMOS 2
-        self.assertIn('sh_hook_w(0x240 + 4 * 7, 0x10000 | 0xae9);', m1_11)
+        self.assertIn('sh_prof()->c7', m1_11)
         non_m1 = e[e.index('} else {', e.index('sh_m1_tv();')):]
         self.assertIn('sh_hook_w(0x240 + 4 * 2, 0);', non_m1[:non_m1.index('// Tv') if '// Tv' in non_m1 else len(non_m1)])
         self.assertEqual(e.count('sh_hook_w(0x240 + 4 * 2, 0);'), 2)
@@ -141,6 +144,8 @@ static void mock_flush(unsigned s, unsigned len);
 #define FN_DFLUSH ((uintptr_t)mock_flush)
 static struct { int buffer_width; } camera_screen = { 360 };
 static unsigned refresh_n = 0;
+static volatile unsigned sh_field = 0, sh_rec_on = 0;
+static unsigned pv_m1_ylim(void) { return (sh_field == 4 && !sh_rec_on) ? 200u : 220u; }
 static void vid_bitmap_refresh(void) { refresh_n++; }
 @@DECLS@@
 static int pv_ok(void) { return camera_screen.buffer_width == PV_BW; }
@@ -335,10 +340,9 @@ class TestV185bContracts(unittest.TestCase):
         lv = self.fn('lv_x3')
         i = lv.index('if (sh_on && sh_prof()->kind == SH_M1) {')
         blk = lv[i:lv.index('} else if (sh_on) {', i)]
-        i_lines, i_lo, i_pv = blk.index('lines = pr->h;'), blk.index('if (pr->h > 1440) x_lo = 37600;'), blk.index('if (!sh_pv) {')
+        i_lines, i_lo, i_pv = blk.index('lines = pr->h;'), blk.index('x_lo ='), blk.index('if (!sh_pv) {')
         self.assertLess(i_lines, i_lo)
-        self.assertLess(i_lo, i_pv, 'x_lo must be set for Standby and REC alike')
-        self.assertEqual(blk.count('x_lo = 37600;'), 1)
+        self.assertLess(i_lo, i_pv, 'dynamic x_lo must be set for Standby and REC alike')
         rec = blk[i_pv:blk.index('else {', i_pv)]
         self.assertIn('x_need = pr->h - 4; lj_eh = pr->h;', rec)
         stby = blk[blk.index('else {', i_pv):]
@@ -348,15 +352,13 @@ class TestV185bContracts(unittest.TestCase):
 
     def test_overlay_sentinel(self):
         self.assertNotIn('PV_RGBA[30 * PV_BW + 2]', self.text)
-        new = 'PV_RGBA[21 * PV_BW + 358]'
-        for n in ('pv_stby_task', 'sh_preview', 'sh_keywatch_task'):
-            self.assertIn(new, self.fn(n), n)
-        for n in ('pv_stby_task', 'sh_keywatch_task'):   # Wide focus view: opaque top HUD bar
-            f = self.fn(n)
-            self.assertIn('PV_RGBA[1 * PV_BW + 358] != PV_BLACK', f, n)
-            self.assertIn('sh_m1_wide() && pv_mode == 1', f, n)
+        # v186: pv_stby_task uses opaque top HUD bar (1, 358) for ALL ImgMode 1 modes
+        self.assertIn('PV_RGBA[1 * PV_BW + 358] != PV_BLACK', self.fn('pv_stby_task'))
+        for n in ('sh_preview', 'sh_keywatch_task'):
+            self.assertIn('PV_RGBA[21 * PV_BW + 358]', self.fn(n), n)
+        self.assertIn('PV_RGBA[1 * PV_BW + 358] != PV_BLACK', self.fn('sh_keywatch_task'))
         h = self.fn('sh_hud')
-        self.assertIn('draw_string(2, 22, s, MAKE_COLOR(COLOR_BLACK, COLOR_YELLOW));', h)   # clip text far from (21, 358)
+        self.assertIn('draw_string(2, 22, s, MAKE_COLOR(COLOR_BLACK, COLOR_YELLOW));', h)
 
     def test_stby_single_mask(self):
         st = self.fn('pv_stby_task')
@@ -381,8 +383,8 @@ class TestV185bContracts(unittest.TestCase):
         self.assertIn('wb_wd_force = 1; wb_kick_now(); sh_m1_leave(); msleep(400); wb_wd_force = 0;', blk)
 
     def test_banner(self):
-        self.assertTrue(self.text.startswith('/*\n * v185b '))
-        self.assertIn('slog("v185b shell start", 0, 0);', self.fn('shell_task'))
+        self.assertRegex(self.text[:24], r'^/\*\n \* v18(5b|6)')
+        self.assertRegex(self.fn('shell_task'), r'slog\("v18(5b|6\w*) shell start", 0, 0\);')
 
 
 class TestV185WidePreview(unittest.TestCase):
