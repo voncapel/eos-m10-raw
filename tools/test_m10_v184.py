@@ -421,12 +421,13 @@ class TestV184Contracts(unittest.TestCase):
                           rf'static inline __attribute__\(\(always_inline\)\) unsigned {n}\([^)]*\);\n(?:[^\n]*\n)*?#e', t)
             self.assertIsNotNone(m, f'always_inline prototype of {n} missing / not GCC-guarded')
             self.assertLess(m.start(), t.index(f'static inline unsigned {n}('))
-        self.assertIn('#define PV_HOT __attribute__((optimize("O2","schedule-insns2")))', t)   # v184b: -mword-relocations build
+        self.assertRegex(t, r'#define\s+PV_HOT\s+__attribute__\(\(optimize\("O2",\s*"schedule-insns2"\)\)\)')   # v184b: -mword-relocations build
         self.assertEqual(strip_comments(t).count('optimize("O2"'), 1)   # only PV_HOT
         self.assertIn('static PV_HOT void pv_render_m1(', t)
 
     def test_render_fixed_view(self):
         body = strip_comments(self.fn('pv_render_m1'))
+        bws = re.sub(r'\s+', ' ', body)
         self.assertNotIn('pv_make_lut(', body)
         self.assertIn('lb = raw_w * bpp / 8', body)
         self.assertIn('const unsigned *lr = pv_lut_r, *lg = pv_lut_g, *lb_t = pv_lut_b;', body)
@@ -442,9 +443,9 @@ class TestV184Contracts(unittest.TestCase):
             self.assertNotIn(bad, m1_row, f'{bad} in the per-pixel loop')
         for s in ('0xFFFF2800u', '0xFF00FF40u', 'mx >= (THR)', 'mx < (THR)', 'do_peak'):
             self.assertIn(s, m1_row)
-        self.assertIn('if (b14) { M1_ROW(14, 0x3fffu, 4, 16320u) }', body)
-        self.assertIn('else if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }', body)
-        self.assertIn('else { M1_ROW(10, 0x3ffu, 0, 1020u) }', body)
+        self.assertIn('if (b14) { M1_ROW(14, 0x3fffu, 4, 16320u) }', bws)
+        self.assertIn('else if (b12) { M1_ROW(12, 0xfffu, 2, 4080u) }', bws)
+        self.assertIn('else { M1_ROW(10, 0x3ffu, 0, 1020u) }', bws)
         self.assertIn('static unsigned pv_lut_r[1024], pv_lut_g[1024], pv_lut_b[1024];', self.text)
         bl = strip_comments(self.fn('pv_build_m1_luts'))
         for s in ('pv_lut_r[v] = PV_BLACK | (pv_sqrt_m1(rr) << 16);', 'pv_lut_g[v] = pv_sqrt_m1(v) << 8;', 'pv_lut_b[v] = pv_sqrt_m1(bb);'):
@@ -461,6 +462,7 @@ class TestV184Contracts(unittest.TestCase):
 
     def test_rec_task(self):
         b = strip_comments(self.fn('pv_rec_task'))
+        bws = re.sub(r'\s+', ' ', b)
         self.assertIn('k = xr_prod - 1;', b)
         self.assertIn('xr_prod - lj_cnt >= lj_raw_n - 1', b)
         self.assertIn('xr_prod - k >= lj_raw_n - 1', b)
@@ -469,7 +471,7 @@ class TestV184Contracts(unittest.TestCase):
         self.assertNotIn('1000', b)
         for ms in re.findall(r'msleep\(\s*(\d+)\s*\)', b):
             self.assertLess(int(ms), 100, 'no long delay in the REC preview loop')
-        self.assertIn('pv_rec_n++; pv_has_img = 1;', b)
+        self.assertIn('pv_rec_n++; pv_has_img = 1;', bws)
         self.assertIn('hr = (cur_mode == 1 && xr_prod - lj_cnt < 2) ? 0 : 1;', b)   # v184b
         self.assertLess(b.index('cur_mode = pv_mode;'), b.index('hr = ('))
         self.assertIn('msleep(30);', b)
@@ -482,7 +484,8 @@ class TestV184Contracts(unittest.TestCase):
         t = self.text
         self.assertIn('static volatile unsigned pv_has_img = 0;', t)
         sp = v185_norm(self.fn('sh_preview'))
-        self.assertIn('ns = (x_exsz > 0x00080000 && fb) ? (x_exsz - 0x00080000) / fb : 1; if (ns > 8) ns = 8; if (ns < 1) ns = 1;', sp)
+        spws = re.sub(r'\s+', ' ', strip_comments(sp))
+        self.assertIn('ns = (x_exsz > 0x00080000 && fb) ? (x_exsz - 0x00080000) / fb : 1; if (ns > 8) ns = 8; if (ns < 1) ns = 1;', spws)
         self.assertIn('pv_stby_ren_sum = pv_stby_fl_sum = 0;', sp)
         self.assertIn('v184b fl_avg=%d', sp)
         self.assertIn('pv_cap_seq % ns', sp)
@@ -491,28 +494,30 @@ class TestV184Contracts(unittest.TestCase):
         self.assertTrue(sp[i:].startswith('x_px = 0;'))
         nxt = sp.index('pv_mask_opaque(', i)
         self.assertTrue(sp[nxt:].startswith('pv_mask_opaque(pv_has_img ? 0 : 1)'), 'REC -> Standby must not black out')
-        self.assertIn('sh_pv_key != 1 && sh_pv_key != 2) pv_mask_opaque(1)', sp)
+        self.assertIn('sh_pv_key != 1 && sh_pv_key != 2) pv_mask_opaque(1)', spws)
         st = v185_norm(self.fn('pv_stby_task'))
-        self.assertIn('pv_stby_n++; pv_has_img = 1;', st)
-        self.assertIn('if (pv_mode == 2) { pv_mask_dirty = 1; pv_has_img = 0; continue; }', st)
+        stws = re.sub(r'\s+', ' ', strip_comments(st))
+        self.assertIn('pv_stby_n++; pv_has_img = 1;', stws)
+        self.assertIn('if (pv_mode == 2) { pv_mask_dirty = 1; pv_has_img = 0; continue; }', stws)
         mc = strip_comments(self.fn('pv_mask_clear'))
         self.assertLess(mc.index('pv_has_img = 0;'), mc.index('if (!pv_ok()) return;'))
 
     def test_stby_timing(self):   # v184b
         st = v185_norm(strip_comments(self.fn('pv_stby_task')))
+        stws = re.sub(r'\s+', ' ', st)
         i_f, i_r = st.index('pv_dflush_m1('), st.index('pv_render_m1(')
         self.assertLess(i_f, i_r)
         self.assertIn('tf = get_tick_count();', st[i_f:i_r])
-        self.assertIn('fl = tf - t; t = get_tick_count() - tf;', st)
+        self.assertIn('fl = tf - t; t = get_tick_count() - tf;', stws)
         self.assertIn('pv_stby_fl_sum += fl;', st)
         self.assertIn('pv_stby_ren_sum += t;', st)
         self.assertRegex(st, r'vid_bitmap_refresh\(\);\s*\n\s*msleep\(5\);')
-        self.assertIn('if (pv_cap_seq - f >= (ns > 1 ? ns - 1 : 1)) { pv_stby_torn++; continue; }', st)
+        self.assertIn('if (pv_cap_seq - f >= (ns > 1 ? ns - 1 : 1)) { pv_stby_torn++; continue; }', stws)
         self.assertIn('pv_stby_ns = 8', self.text)
 
     def test_unload_guards(self):
         for n in ('_module_can_unload', '_module_exit_alt'):
-            m = re.search(rf'^int {n}\(\)[^\n]*', self.text, re.M)
+            m = re.search(rf'^int {n}\(\)\s*\{{[^}}]*\}}', self.text, re.M)
             self.assertIsNotNone(m)
             self.assertIn('pv_stby_done', m.group(0))
             self.assertIn('pv_rec_done', m.group(0))
@@ -553,11 +558,11 @@ int main(void) {
                                 pv_mode = mode; pv_peak = pk; pv_zebra = zb;
                                 memset(fake_rgba, 0x5a, sizeof(fake_rgba));
                                 pv_stat[0] = fi; pv_stat[2] = 777; pv_clip_pct = 999;
-                                pv_render_m1_ref((const char *)f, bpp, hr);
+                                pv_render_m1_ref((const char *)f, bpp, hr, 1920, 1440);
                                 memcpy(a, fake_rgba, sizeof(a)); ca = pv_clip_pct; s0a = pv_stat[0]; s2a = pv_stat[2];
                                 memset(fake_rgba, 0x5a, sizeof(fake_rgba));
                                 pv_stat[0] = fi; pv_stat[2] = 777; pv_clip_pct = 999;
-                                pv_render_m1((const char *)f, bpp, hr);
+                                pv_render_m1((const char *)f, bpp, hr, 1920, 1440);
                                 if (memcmp(a, fake_rgba, sizeof(a)) || ca != pv_clip_pct || s0a != pv_stat[0] || s2a != pv_stat[2]) {
                                     printf("MISMATCH bpp=%u k=%u mode=%u hr=%d pk=%u zb=%u fi=%u\n", bpp, k, mode, hr, pk, zb, fi);
                                     return 1;
@@ -574,23 +579,24 @@ int main(void) {
 
 
 class TestV184cIdentical(unittest.TestCase):
-    """v184c pv_render_m1 must be bit-identical to the archived v184b one (pixels, clip %, stats)."""
+    """Current pv_render_m1 must be bit-identical to archived v186 (pixels, clip %, stats)."""
     def test_bit_identical_to_v184b(self):
-        old = Path(os.environ.get('M10_BUILDS', ROOT / 'builds')) / 'v184b/m10_cine.c'   # archived build (not public)
+        old = Path(os.environ.get('M10_BUILDS', ROOT / 'builds')) / 'v186/m10_cine.c'   # archived build (not public)
         if not old.exists():
-            self.skipTest('builds/v184b/m10_cine.c missing (set M10_BUILDS)')
+            self.skipTest('builds/v186/m10_cine.c missing (set M10_BUILDS)')
         text = C_SRC.read_text()
         ref = func_def(old.read_text(), 'pv_render_m1')
         self.assertIsNotNone(ref)
         ref = ref.replace('pv_render_m1(', 'pv_render_m1_ref(', 1)
-        funcs = [func_def(text, n) for n in ('pv_sqrt_m1', 'pv_build_m1_luts', 'pv_render_m1')]
+        m1_row = re.search(r'^#define\s+M1_ROW\b(?:[^\n]*\\\n)*[^\n]*', text, re.M).group(0)
+        funcs = [func_def(text, n) for n in ('pv_sqrt_m1', 'pv_build_m1_luts', 'pv_m1_rect', 'pv_render_m1')]
         self.assertTrue(all(funcs))
         decls = []
         for n in ('pv_stat', 'pv_lut', 'pv_lut_r', 'pv_m1_lut_ok', 'pv_zebra', 'pv_peak', 'pv_mode'):
             d = decl(text, n)
             if d not in decls:
                 decls.append(d)
-        prefix = HARNESS.split('@@FUNCS@@')[0].replace('@@DECLS@@', '\n'.join(decls))
+        prefix = HARNESS.split('@@FUNCS@@')[0].replace('@@DECLS@@', '\n'.join(decls) + '\n' + m1_row)
         res = run_c(prefix + '\n'.join(funcs + [ref]) + IDENT_MAIN)
         print(res.stdout, end='')
         self.assertIn('v184c identical combos=576', res.stdout)
@@ -607,9 +613,9 @@ class TestV184cContracts(unittest.TestCase):
         return strip_comments(d)
 
     def test_banner(self):
-        self.assertRegex(self.text[:24], r'^/\*\n \* v18(4c|5b?|6\w*) ')
+        self.assertRegex(self.text[:24], r'^/\*\n \* v18(4c|5b?|6\w*|7\w*) ')
         st = self.fn('shell_task')
-        self.assertRegex(st, r'slog\("v18(4c|5b?|6\w*) shell start", 0, 0\);')
+        self.assertRegex(st, r'slog\("v18(4c|5b?|6\w*|7\w*) shell start", 0, 0\);')
         self.assertNotIn('v183d shell start', st)
 
     def test_pwr_lock_apo(self):
@@ -633,7 +639,7 @@ class TestV184cContracts(unittest.TestCase):
     def test_ipc_rec_guard(self):
         st = self.fn('shell_task')
         i = st.index('sh_ipc_req(SH_IPC_REC, 8000);')
-        before, after = st[st.rindex('sh_hud(1);', 0, i):i], st[i:i + 80]
+        before, after = re.sub(r'\s+', ' ', st[st.rindex('sh_hud(1);', 0, i):i]), st[i:i + 80]
         self.assertIn('wb_wd_force = 1; wb_kick_now();', before)
         self.assertIn('if (*(volatile unsigned *)0x865c == 1) { sh_m1_restore_tables(); sh_expo_off(); sh_ipc_req(SH_IPC_M1_OFF, 5000); }', before)
         self.assertLess(before.index('wb_kick_now();'), before.index('0x865c == 1'))
@@ -649,7 +655,7 @@ class TestV184cContracts(unittest.TestCase):
 
     def test_exit_sequence(self):
         st = self.fn('shell_task')
-        o = st[st.index('out:'):]
+        o = re.sub(r'\s+', ' ', st[st.index('out:'):])
         seq = ['wb_wd_force = 1; wb_kick_now();', 'sh_m1_leave();', 'msleep(400);', 'wb_wd_force = 0;', 'wb_wd_end();',
                'sh_ipc_req(SH_IPC_END', 'while (kbd_is_key_pressed(KEY_MENU) && get_tick_count() - t < 3000) msleep(20);',
                'sh_on = 0;', 'exit_alt();']
@@ -658,13 +664,14 @@ class TestV184cContracts(unittest.TestCase):
 
     def test_render_split(self):
         body = strip_comments(func_def(self.text, 'pv_render_m1'))
+        bws = re.sub(r'\s+', ' ', body)
         self.assertEqual(self.text.count('static PV_HOT void pv_render_m1('), 1)
-        self.assertIn('else if (st == 1) {', body)
-        self.assertEqual(body.count('q[lb_hw]'), 2)
-        self.assertIn('n += (W + 3) >> 2;', body)
-        self.assertEqual(body.count('if (!(x & 3)) n--;'), 2)
-        i = body.index('else if (st == 1) {'); j = body.index('} else {', i); k = body.index('else { M1_ROW(10', j)
-        fast, peak = body[i:j], body[j:k]
+        self.assertIn('else if (st == 1) {', bws)
+        self.assertEqual(bws.count('q[lb_hw]'), 2)
+        self.assertIn('n += (W + 3) >> 2;', bws)
+        self.assertEqual(bws.count('if (!(x & 3)) n--;'), 2)
+        i = bws.index('else if (st == 1) {'); j = bws.index('} else {', i); k = bws.index('else { M1_ROW(10', j)
+        fast, peak = bws[i:j], bws[j:k]
         for bad in ('pk_prev', 'g_left', 'st == 2', 'do_peak && ', 'mx', '/'):
             self.assertNotIn(bad, fast, f'{bad} in the 10b fast row')
         for bad in ('st == 2', 'mx', '/', 'col_x'):
@@ -676,7 +683,7 @@ class TestV184cContracts(unittest.TestCase):
 class TestV185Dispatch(unittest.TestCase):
     """v185/v186: pv_m1_* dispatch cleanly between Wide 1:3 and 1:1 arbitrary-geometry renderers."""
     def test_dispatchers(self):
-        text = C_SRC.read_text()
+        text = re.sub(r'\s+', ' ', strip_comments(C_SRC.read_text()))
         for s in ('static void pv_m1_mask(int full) { if (sh_m1_wide()) pv_mask_opaque_wide(full, sh_m1_h()); else pv_mask_opaque(full, sh_m1_w(), sh_m1_h()); }',
                   'static void pv_m1_dflush(unsigned phys, unsigned lb, unsigned mode, int hr) { if (sh_m1_wide()) pv_dflush_m1_wide(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); else pv_dflush_m1(phys, lb, mode, hr, sh_m1_w(), sh_m1_h()); }',
                   'static void pv_m1_render(const char *frame, unsigned bpp, int hr) { if (sh_m1_wide()) pv_render_m1_wide(frame, bpp, hr, sh_m1_w(), sh_m1_h()); else pv_render_m1(frame, bpp, hr, sh_m1_w(), sh_m1_h()); }',

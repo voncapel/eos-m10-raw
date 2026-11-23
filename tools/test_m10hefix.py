@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = Path(__file__).resolve().parents[1] / "module" / "m10_cine.c"
+_ROOT = Path(__file__).resolve().parents[1]
+SOURCE = (_ROOT / 'module/m10_cine.c' if (_ROOT / 'module/m10_cine.c').exists()
+          else _ROOT / 'src/chdk/trunk/modules/m10_cine.c')
 
 
 def body_at(text, marker):
@@ -23,7 +25,8 @@ def body_at(text, marker):
 class HEFixTest(unittest.TestCase):
     def test_failed_restore_preserves_error_frame_identity(self):
         text = SOURCE.read_text()
-        start = text.index('// v172b: an early kick proves')
+        marker = '// an early kick proves' if '// an early kick proves' in text else '// v172b: an early kick proves'
+        start = text.index(marker)
         end = text.index('            if (lj_on && x_ready > fr', start)
         code = text[start:end].replace('*(volatile unsigned *)(0x0000fa68 + 0x1c)', 'head_error')
         program = '''#include <assert.h>

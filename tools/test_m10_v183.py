@@ -68,9 +68,10 @@ def run_c(code: str, extra_flags=()):
 
 
 def recipe_fields(text: str, name: str):
-    m = re.search(rf'#define {name} "([^"]+)"', text)
+    m = re.search(rf'^#define\s+{name}\b(?:[^\n]*\\\n)*[^\n]*', text, re.M)
     assert m, f'{name} missing'
-    return m.group(1).replace('\\n', '').split()
+    joined = ''.join(re.findall(r'"([^"]*)"', m.group(0)))
+    return joined.replace('\\n', '').split()
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -488,7 +489,10 @@ class TestV183FpsAndTimestamps(unittest.TestCase):
             if d and 'put32(h + 8' in d:
                 self.assertNotIn('(xr_tick[k]) * 1000', d, f'{fn} still stamps VIDF from the ms tick')
         self.assertNotIn('put32(h + 8, (xr_tick[k]) * 1000)', text)
-        fps_blk = text[text.index('lm2.ndone = xr_wr;'):text.index('if (xr_mlv) mlv_finalize', text.index('lm2.ndone = xr_wr;'))]
+        i_nd = text.index('lm2.ndone = xr_wr;')
+        m_fin = re.search(r'if\s*\(xr_mlv\)\s*mlv_finalize', text[i_nd:])
+        self.assertIsNotNone(m_fin, 'mlv_finalize call not found after lm2.ndone = xr_wr;')
+        fps_blk = text[i_nd:i_nd + m_fin.start()]
         self.assertIn('xr_drop_at', fps_blk, 'mlv_fps1000 block must account for drops via xr_drop_at')
         self.assertIn('1000000000u / per_us', fps_blk, 'mlv_fps1000 must derive fps from measured sensor period')
 

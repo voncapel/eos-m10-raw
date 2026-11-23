@@ -72,11 +72,12 @@ class TestV185Tables(unittest.TestCase):
         for tag, p in P.items():
             if p['kind'] == 'SH_M1':
                 self.assertLessEqual((p['h'] - p['h'] // 2) * (p['w'] * p['bpp'] // 8), 0x400000, tag)
+        tws = re.sub(r'\s+', ' ', strip_comments(t))
         self.assertIn('#define SH_IPC_ARG_OFF 0x280', t)
-        self.assertIn('static unsigned sh_m1_fc3c(void) { return (7058u - 2u * sh_m1_head_h()) / 2u; }', t)
-        self.assertIn('static unsigned sh_m1_head_h(void) { return sh_m1_h() + 16; }', t)
+        self.assertIn('static unsigned sh_m1_fc3c(void) { return (7058u - 2u * sh_m1_head_h()) / 2u; }', tws)
+        self.assertIn('static unsigned sh_m1_head_h(void) { return sh_m1_h() + 16; }', tws)
         self.assertEqual(((7058 - 2 * (1800 + 16)) // 2, (7058 - 2 * (1440 + 16)) // 2), (1713, 2073))
-        lv = strip_comments(func_def(t, 'lv_x3'))
+        lv = re.sub(r'\s+', ' ', strip_comments(func_def(t, 'lv_x3')))
         for s in ('lines = pr->h;', 'if (lines > 1800) lines = 1800;', 'x_need = pr->h - 4; lj_eh = pr->h;'):
             self.assertIn(s, lv)
 
@@ -343,9 +344,9 @@ class TestV185bContracts(unittest.TestCase):
         i_lines, i_lo, i_pv = blk.index('lines = pr->h;'), blk.index('x_lo ='), blk.index('if (!sh_pv) {')
         self.assertLess(i_lines, i_lo)
         self.assertLess(i_lo, i_pv, 'dynamic x_lo must be set for Standby and REC alike')
-        rec = blk[i_pv:blk.index('else {', i_pv)]
+        rec = re.sub(r'\s+', ' ', blk[i_pv:blk.index('else {', i_pv)])
         self.assertIn('x_need = pr->h - 4; lj_eh = pr->h;', rec)
-        stby = blk[blk.index('else {', i_pv):]
+        stby = re.sub(r'\s+', ' ', blk[blk.index('else {', i_pv):])
         self.assertIn('bpp = 10; x_rsel = 0x10; x_he_fix = 0;', stby)
         self.assertIn('x_need = pr->h - 4;', stby)
         self.assertNotIn('lj_eh', stby)
@@ -364,7 +365,7 @@ class TestV185bContracts(unittest.TestCase):
         st = self.fn('pv_stby_task')
         head = st[:st.index('if (!f || f == last')]
         self.assertNotRegex(head, r'pv_m1_mask\(0\);[^\n]*\n[^\n]*if \(pv_hud_dirty\) \{ pv_hud_dirty = 0; if \(sh_m1_wide\(\)\) pv_m1_mask\(0\);')
-        self.assertIn('if (sh_m1_wide() && !masked) pv_m1_mask(0);', head)
+        self.assertIn('if (sh_m1_wide() && !masked) pv_m1_mask(0);', re.sub(r'\s+', ' ', head))
         self.assertIn('masked = 1;', head)
 
     def test_m1_enter_wipe(self):
@@ -376,15 +377,15 @@ class TestV185bContracts(unittest.TestCase):
     def test_profile_leave_wb_keepalive(self):
         st = self.fn('shell_task')
         i = st.index('if (prev_kind == SH_M1 && pr->kind != SH_M1) {')
-        blk = st[i:st.index('prev_kind = pr->kind;', i)]
+        blk = re.sub(r'\s+', ' ', st[i:st.index('prev_kind = pr->kind;', i)])
         seq = ['wb_wd_force = 1;', 'wb_kick_now();', 'sh_m1_leave();', 'msleep(400);', 'wb_wd_force = 0;', 'sh_arm_fps(pr, !zoom);']
         pos = [blk.index(s) for s in seq]
         self.assertEqual(pos, sorted(pos))
         self.assertIn('wb_wd_force = 1; wb_kick_now(); sh_m1_leave(); msleep(400); wb_wd_force = 0;', blk)
 
     def test_banner(self):
-        self.assertRegex(self.text[:24], r'^/\*\n \* v18(5b|6)')
-        self.assertRegex(self.fn('shell_task'), r'slog\("v18(5b|6\w*) shell start", 0, 0\);')
+        self.assertRegex(self.text[:24], r'^/\*\n \* v18(5b|6|7)')
+        self.assertRegex(self.fn('shell_task'), r'slog\("v18(5b|6\w*|7\w*) shell start", 0, 0\);')
 
 
 class TestV185WidePreview(unittest.TestCase):

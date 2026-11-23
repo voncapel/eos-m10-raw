@@ -23,9 +23,9 @@ class V167ModuleTests(unittest.TestCase):
         cls.src = MODULE_C.read_text()
 
     def test_sh_recipe_xneed_and_diag_gate(self):
-        m = re.search(r'#define\s+SH_RECIPE\s+"([^"\\]+)\\n"', self.src)
+        m = re.search(r'^#define\s+SH_RECIPE\b(?:[^\n]*\\\n)*[^\n]*', self.src, re.M)
         self.assertIsNotNone(m)
-        fields = m.group(1).split()
+        fields = ''.join(re.findall(r'"([^"]*)"', m.group(0))).replace('\\n', '').split()
         self.assertGreaterEqual(len(fields), 55)
         self.assertEqual(fields[7], '80000003')   # x_xo: bit 29 (x_diag) clear
         self.assertEqual(fields[11], '1102')      # x_need: reject incomplete short frames
@@ -33,14 +33,17 @@ class V167ModuleTests(unittest.TestCase):
         self.assertEqual(fields[52], '48')        # 48 MiB EXMEM
 
         # Verify ea_take(0/2) and hs_take(0/1/2) inside lv_x3 REC loop require x_diag
-        rec_block = extract_c_block(self.src, 'if (x_he_n >= x_hbn', 'if (r == 2) { drops++')
+        rec_block = extract_c_block(self.src, 'if (x_he_n >= x_hbn', 'if (r == 2) {')
         for fn in ('hs_take(1)', 'hs_take(0)', 'ea_take(0)', 'hs_take(2)', 'ea_take(2)'):
             idx = rec_block.index(fn)
             line = rec_block[rec_block.rfind('\n', 0, idx) + 1:rec_block.find('\n', idx)]
             self.assertIn('x_diag', line, f'{fn} must be gated by x_diag: {line}')
 
         # Verify post-capture tick overwrite skips lj_on frames
-        self.assertIn('if (!lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; }', self.src)
+        self.assertIn(
+            'if (!lj_on && fr < XR_MAX) { xr_slot[fr] = slot; xr_tick[fr] = get_tick_count() - t0; }',
+            re.sub(r'\s+', ' ', self.src),
+        )
 
     def test_profiles_geometry_and_fps_math(self):
         block = extract_c_block(self.src, 'static const sh_prof_t sh_profs[] = {', '};')
@@ -79,7 +82,7 @@ class V167ModuleTests(unittest.TestCase):
     def test_c_mlv_chunk_finalize_and_lj_drain(self):
         mlv_helpers = extract_c_block(self.src, 'static unsigned char mlv_hdr[512];', 'static unsigned x_skipn')
         mlv_code = extract_c_block(self.src, 'static unsigned mlv_guid_lo = 0;', 'static void mlv_frame_hdr')
-        roll_code = extract_c_block(self.src, 'static unsigned xr_fbytes', '// v101: compressed REC.')
+        roll_code = extract_c_block(self.src, 'static unsigned xr_fbytes', '// compressed REC.')
         drain_code = extract_c_block(self.src, 'static void lj_drain(void)', 'static void lj_kick(unsigned fr)')
 
         harness = r'''

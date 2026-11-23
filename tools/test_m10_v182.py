@@ -260,14 +260,15 @@ class TestV182WatchdogAndRoll(unittest.TestCase):
         self.assertIn('#define FN_UNLOCK_PWR  0xfc1fb425', text)
 
     def test_sh_recipe_m1_fields(self):
+        def macro_str(src, name):
+            m = re.search(rf'^#define\s+{name}\b(?:[^\n]*\\\n)*[^\n]*', src, re.M)
+            self.assertIsNotNone(m, f'{name} missing')
+            return ''.join(re.findall(r'"([^"]*)"', m.group(0)))
+
         text = C_SRC.read_text()
-        m = re.search(r'#define SH_RECIPE_M1 "([^"]+)"', text)
-        self.assertIsNotNone(m)
-        fields = m.group(1).replace('\\n', '').split()
+        fields = macro_str(text, 'SH_RECIPE_M1').replace('\\n', '').split()
         self.assertEqual(len(fields), 58)  # 58 space-separated tokens = fields 1..58? Wait let's check SH_RECIPE count!
-        m_ref = re.search(r'#define SH_RECIPE "([^"]+)"', text)
-        self.assertIsNotNone(m_ref)
-        ref_fields = m_ref.group(1).replace('\\n', '').split()
+        ref_fields = macro_str(text, 'SH_RECIPE').replace('\\n', '').split()
         self.assertEqual(len(fields), len(ref_fields), f'M1 has {len(fields)} fields vs SH_RECIPE {len(ref_fields)}')
         self.assertEqual(fields[0], '3000')
         self.assertEqual(fields[1], '1440')
