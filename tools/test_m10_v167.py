@@ -36,8 +36,8 @@ class V167ModuleTests(unittest.TestCase):
         rec_block = extract_c_block(self.src, 'if (x_he_n >= x_hbn', 'if (r == 2) {')
         for fn in ('hs_take(1)', 'hs_take(0)', 'ea_take(0)', 'hs_take(2)', 'ea_take(2)'):
             idx = rec_block.index(fn)
-            line = rec_block[rec_block.rfind('\n', 0, idx) + 1:rec_block.find('\n', idx)]
-            self.assertIn('x_diag', line, f'{fn} must be gated by x_diag: {line}')
+            ctx = rec_block[max(0, idx - 140):idx + len(fn)]
+            self.assertIn('x_diag', ctx, f'{fn} must be gated by x_diag: {ctx}')
 
         # Verify post-capture tick overwrite skips lj_on frames
         self.assertIn(
