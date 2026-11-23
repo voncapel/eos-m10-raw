@@ -160,6 +160,7 @@ Want to understand how we unlocked **`3.3×` faster JpCore encoding (`339 MB/s`)
 | Document | Contents |
 |---|---|
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Full technical pipeline: `ImgMode 1` (`1:1` & `Wide 1:3`), **`LCLK_HOLD0` / `ClockSave` turbo clock holds**, 2-block CH12 `> 4 MiB` DMA, optical centring (`x0`), Magic Lantern-style HUD, live 10/12/14-bit colour preview, and Hybrid CMOS AF II focus pixel map |
+| **[docs/DIGIC6_OMAR.md](docs/DIGIC6_OMAR.md)** | **Omar sub-processor analysis (`1.10d` ROM)**: 2nd Cortex-R4 core (`Dry[OMAR]>`), ATCM/BTCM & DRAM memory map, Marius boot/reset (`0xd20f0110`) & WFI stop, `postman` mailbox (`0xd2000000`), shared DUKE clock-gear (`0xd209f154`/`0xd209f158`), and why M10 EDMACs live on Marius rather than Omar |
 | **[docs/HISTORY.md](docs/HISTORY.md)** | Full R&D log from day 1 through `v186`, including every dead end and breakthrough |
 | **[docs/HANDOFF.md](docs/HANDOFF.md)** | Current state (`v186`), open next branches (audio `AUDF`, `XR_MAX`), host dev workflow, and card file reference |
 | **[docs/TOOLS.md](docs/TOOLS.md)** | Index of every Python / Lua / C tool and how to run the offline ASan/UBSan test suite (`python3 -B -m unittest discover -s tools -p 'test_*.py'`) |
